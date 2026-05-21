@@ -1,0 +1,316 @@
+version: 1
+
+# ── Runtime parameters ────────────────────────────────────────────────────────
+runtime:
+  phase0:
+    concurrency: 500
+    timeout: 3       # seconds per connection attempt
+    retries: 1       # retry count on timeout
+  phase1:
+    concurrency: 300
+    timeout: 5
+  phase2:
+    concurrency: 200
+    timeout: 5
+    max_extra_gets: 3   # budget for additional GETs per target in Phase 2
+  phase3:
+    concurrency: 100
+    timeout: 10
+    retries: 1
+
+# ── Phase 0 – Non-HTTP exclusion ──────────────────────────────────────────────
+phase0:
+  # Raw byte prefixes that indicate non-HTTP services.
+  # Strings are UTF-8 encoded; use exact service banner starts.
+  non_http_prefixes:
+    - "-ERR"      # Redis error reply
+    - "+OK"       # Redis inline OK
+    - "+PONG"     # Redis PING reply
+    - "SSH-2.0"   # SSH-2 banner
+    - "* OK"      # IMAP greeting (authenticated)
+    - "* BYE"     # IMAP goodbye
+    - "220 "      # SMTP / FTP service ready (note trailing space)
+
+  # Fraction of non-printable bytes in the first 512 bytes that triggers
+  # "binary response" exclusion (databases, custom binary protocols).
+  binary_threshold: 0.30
+
+
+# ── Phase 1 – LLM fingerprinting ─────────────────────────────────────────────
+phase1:
+  # Probe paths sent in priority order.  "/" is always last; it is reused
+  # from the Phase 0 cache.  Stop probing once an API path confirms LLM.
+  probe_paths:
+    - /v1/models
+    - /api/tags
+    - /api/version
+    - /info
+    - /health
+    - /docs
+    - /
+
+  # Confirm rules: each entry maps a probe path to the JSON/body condition
+  # that signals a real LLM API (→ is_llm = "确认").
+  # Rules are evaluated in probe_paths order; first match wins.
+  confirm_rules:
+    - path: /v1/models
+      when_status: 200
+      match:
+        type: json_all
+        rules:
+          - { field: object, op: eq, value: list }
+          - { field: data,   op: exists }
+
+    - path: /api/tags
+      when_status: 200
+      match:
+        type: json_has_key
+        key: models
+
+    - path: /api/version
+      when_status: 200
+      match:
+        type: json_has_key
+        key: version
+
+    - path: /info
+      when_status: 200
+      match:
+        type: json_has_key
+        key: model_id
+
+    # /health: probed but no confirm rule defined here – intentionally omitted
+    # (llama.cpp /health alone is too ambiguous; detected via /props in Phase 2)
+
+    - path: /docs
+      when_status: any
+      match:
+        type: body_substring_any
+        values:
+          - /v1/chat/completions
+          - /v1/embeddings
+          - /api/generate
+
+  # Suspect detection: "/" response body contains frontend framework signals
+  # (→ is_llm = "疑似" when no API path confirmed LLM).
+  suspect:
+    keywords:
+      - gradio
+      - streamlit
+      - open-webui
+      - __gradio_mode__
+      - _stcore
+    # Additional compound predicate: body must contain ALL of these
+    extra_predicates:
+      - type: body_all_substrings_ci
+        values: [chat, model]
+
+  # Guards: downgrade "确认" to "疑似" when the root page already shows a
+  # frontend-only UI that makes the API signal ambiguous.
+  guards:
+    - description: "frontend UI overrides weak API-only signal"
+      root_contains_any:
+        - "open webui"
+        - "open-webui"
+        - "__gradio_mode__"
+        - "gradio-app"
+        - "_stcore"
+        - "streamlit"
+      downgrade_for_paths:
+        - /api/version
+
+
+# ── Phase 2 – Deploy tool identification ─────────────────────────────────────
+# Tools are evaluated in order; first match wins and returns immediately.
+# scope values: "confirmed" and/or "suspect".
+# For "suspect" targets only root-sourced checks are allowed (cache reads only).
+#
+# Source prefixes:
+#   root                 – cached GET /
+#   cached:<path>        – read from probe cache (no new request)
+#   get:<path>           – always perform a fresh GET (counts toward max_extra_gets)
+#   cached_or_get:<path> – use cache if present, else GET
+#
+# match.type values: see scan_config.py eval_match() docstring.
+phase2:
+  tools:
+    # ── Root-based checks (run for both confirmed and suspect) ────────────────
+    - name: open-webui
+      scope: [confirmed, suspect]
+      match:
+        source: root
+        type: body_substring_any_ci
+        values: ["open webui", "open-webui"]
+
+    # ── API-based checks (confirmed only) ────────────────────────────────────
+    - name: ollama
+      scope: [confirmed]
+      match:
+        source: "cached:/api/tags"
+        type: json_has_key
+        key: models
+      # Fetch /api/version to populate deploy_version
+      version_from:
+        source: "cached_or_get:/api/version"
+        type: json_field
+        field: version
+
+    - name: tgi
+      scope: [confirmed]
+      match:
+        source: "cached:/info"
+        type: json_all_keys_exist
+        keys: [model_id, max_input_length]
+
+    - name: vllm
+      scope: [confirmed]
+      match:
+        source: "cached:/v1/models"
+        type: json_nested_contains_ci
+        json_path: "data.0.owned_by"
+        value: vllm
+      # Supplemental probe: Prometheus metrics endpoint
+      supplements:
+        - source: "get:/metrics"
+          type: body_substring
+          value: "vllm_"
+
+    # The following tools require /v1/models to have been confirmed 200 in
+    # Phase 1 (requires_cached_ok).  They add evidence for that path
+    # automatically even when their own probe determines the final match.
+    - name: llama.cpp
+      scope: [confirmed]
+      requires_cached_ok: /v1/models
+      match:
+        source: "get:/props"
+        type: body_substring
+        value: default_generation_settings
+
+    - name: fastchat
+      scope: [confirmed]
+      requires_cached_ok: /v1/models
+      match:
+        source: "cached_or_get:/docs"
+        type: body_substring_ci
+        value: fastchat
+
+    - name: xinference
+      scope: [confirmed]
+      requires_cached_ok: /v1/models
+      match:
+        source: "cached_or_get:/docs"
+        type: body_substring_ci
+        value: xinference
+
+    - name: localai
+      scope: [confirmed]
+      requires_cached_ok: /v1/models
+      match:
+        source: "cached_or_get:/docs"
+        type: body_substring_any_ci
+        values: [localai, "models/available"]
+
+    # Fallback for any /v1/models-confirmed target that didn't match above
+    - name: "未知-OpenAI兼容"
+      scope: [confirmed]
+      requires_cached_ok: /v1/models
+      match:
+        type: always
+
+    - name: langserve
+      scope: [confirmed]
+      match:
+        source: "cached_or_get:/docs"
+        type: body_any_of
+        conditions:
+          - { type: body_substring_ci, value: langserve }
+          - { type: body_all_substrings_ci, values: [invoke, stream] }
+
+    # ── Root fallbacks (run for confirmed after API checks; primary for suspect)
+    - name: gradio
+      scope: [confirmed, suspect]
+      match:
+        source: root
+        type: body_substring_any_ci
+        values: ["__gradio_mode__", "gradio-app", "gradio"]
+
+    - name: streamlit
+      scope: [confirmed, suspect]
+      match:
+        source: root
+        type: body_substring_any_ci
+        values: [_stcore, streamlitapp, streamlit]
+
+    - name: open-webui
+      scope: [confirmed]
+      match:
+        source: root
+        type: body_substring_ci
+        value: "open-webui"
+
+
+# ── Phase 3 – Model info extraction ──────────────────────────────────────────
+phase3:
+  # Cached GET responses checked in priority order before any new requests.
+  cache_sources:
+    - path: /v1/models
+      extract:
+        type: json_list_field
+        list_key: data
+        item_field: id
+
+    - path: /api/tags
+      extract:
+        type: json_list_field
+        list_key: models
+        item_field: name
+
+    - path: /info
+      extract:
+        type: json_field
+        field: model_id
+
+  # POST probes tried in order when cached sources yield nothing.
+  post_probes:
+    - path: /v1/chat/completions
+      method: POST
+      body:
+        model: test
+        messages:
+          - role: user
+            content: hi
+        max_tokens: 1
+      on_success:
+        status: [200]
+        extract:
+          type: json_field
+          field: model
+      on_error:
+        status: [400, 404, 422]
+        extract:
+          type: error_regex
+          # Captures quoted tokens; filter keeps likely model identifiers
+          regex: '"([a-zA-Z0-9_\-./: ]+)"'
+          filter:
+            min_len: 3
+            max_len: 80
+            must_contain_any_char: ["/", ":", "-"]
+
+    - path: /api/generate
+      method: POST
+      body:
+        model: test
+        prompt: hi
+        stream: false
+      on_error:
+        status: [400, 404, 422]
+        extract:
+          type: error_regex
+          regex: '"([a-zA-Z0-9_\-./: ]+)"'
+          filter:
+            min_len: 3
+            max_len: 80
+            must_contain_any_char: ["/", ":", "-"]
+
+  # Value written to model_info when nothing is found
+  fallback_literal: "未知"
