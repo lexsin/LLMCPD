@@ -101,6 +101,8 @@ def eval_match(spec: Dict[str, Any], body: str, raw: bytes = b"") -> bool:
 
     if t == "body_all_substrings_ci":
         bl = body.lower()
+        if any(ex.lower() in bl for ex in spec.get("exclude_if_contains", [])):
+            return False
         return all(v.lower() in bl for v in spec.get("values", []))
 
     if t == "body_any_of":
@@ -186,6 +188,7 @@ def extract_models(spec: Dict[str, Any], body: str) -> List[str]:
         min_len = filt.get("min_len", 0)
         max_len = filt.get("max_len", 9999)
         must_chars = filt.get("must_contain_any_char", [])
+        exclude_pats = [ep.lower() for ep in spec.get("exclude_patterns", [])]
         try:
             d = json.loads(body)
             msg = (
@@ -195,12 +198,32 @@ def extract_models(spec: Dict[str, Any], body: str) -> List[str]:
             )
         except (json.JSONDecodeError, AttributeError):
             msg = body
+
+        def _passes_filter(c: str) -> bool:
+            if not (min_len < len(c) < max_len):
+                return False
+            if must_chars and not any(ch in c for ch in must_chars):
+                return False
+            if exclude_pats and c.lower() in exclude_pats:
+                return False
+            return True
+
+        # context_patterns: more precise regexes tried first
+        context_patterns = spec.get("context_patterns", [])
+        if context_patterns:
+            ctx_results: List[str] = []
+            for cp in context_patterns:
+                try:
+                    ctx_results.extend(re.findall(cp, msg))
+                except re.error:
+                    pass
+            precise = [c for c in ctx_results if _passes_filter(c)]
+            if precise:
+                return precise
+
+        # Fallback to general regex
         candidates = re.findall(regex, msg)
-        return [
-            c for c in candidates
-            if min_len < len(c) < max_len
-            and (not must_chars or any(ch in c for ch in must_chars))
-        ]
+        return [c for c in candidates if _passes_filter(c)]
 
     return []
 
@@ -245,6 +268,7 @@ class Phase1Config:
     suspect_keywords: List[str]
     suspect_predicates: List[Dict]
     guards: List[Dict]
+    auth_suspect: Optional[Dict] = None  # {status_codes: [...], body_keywords: [...]}
 
 
 @dataclass
@@ -324,6 +348,7 @@ def _parse_phase1(d: dict) -> Phase1Config:
         suspect_keywords=suspect.get("keywords", []),
         suspect_predicates=suspect.get("extra_predicates", []),
         guards=p.get("guards", []),
+        auth_suspect=p.get("auth_suspect"),
     )
 
 
@@ -402,17 +427,38 @@ def _build_hardcoded_default() -> ScanConfig:
                 b"SSH-2.0",
                 b"* OK", b"* BYE",
                 b"220 ",
+                b"RFB ",
+                b"\xff\xfd",
+                b"\x4a\x00\x00\x00",
+                b"N\x00\x00\x00",
             ],
             binary_threshold=0.30,
         ),
         phase1=Phase1Config(
             probe_paths=[
-                "/v1/models", "/api/tags", "/api/version",
-                "/info", "/health", "/docs", "/",
+                "/v1/models", "/api/v1/models", "/openai/v1/models",
+                "/api/tags", "/api/version",
+                "/info", "/health", "/docs", "/v2/models", "/",
             ],
             confirm_rules=[
                 {
                     "path": "/v1/models", "when_status": 200,
+                    "match": {"type": "json_all", "rules": [
+                        {"field": "object", "op": "eq", "value": "list"},
+                        {"field": "data",   "op": "exists"},
+                    ]},
+                },
+                {
+                    "path": "/api/v1/models", "when_status": 200,
+                    "cache_also_as": "/v1/models",
+                    "match": {"type": "json_all", "rules": [
+                        {"field": "object", "op": "eq", "value": "list"},
+                        {"field": "data",   "op": "exists"},
+                    ]},
+                },
+                {
+                    "path": "/openai/v1/models", "when_status": 200,
+                    "cache_also_as": "/v1/models",
                     "match": {"type": "json_all", "rules": [
                         {"field": "object", "op": "eq", "value": "list"},
                         {"field": "data",   "op": "exists"},
@@ -431,6 +477,10 @@ def _build_hardcoded_default() -> ScanConfig:
                     "match": {"type": "json_has_key", "key": "model_id"},
                 },
                 {
+                    "path": "/v2/models", "when_status": 200,
+                    "match": {"type": "json_has_key", "key": "models"},
+                },
+                {
                     "path": "/docs", "when_status": "any",
                     "match": {"type": "body_substring_any", "values": [
                         "/v1/chat/completions", "/v1/embeddings", "/api/generate",
@@ -442,7 +492,13 @@ def _build_hardcoded_default() -> ScanConfig:
                 "__gradio_mode__", "_stcore",
             ],
             suspect_predicates=[
-                {"type": "body_all_substrings_ci", "values": ["chat", "model"]},
+                {
+                    "type": "body_all_substrings_ci",
+                    "values": ["chat", "model"],
+                    "exclude_if_contains": [
+                        "copyright", "terms of service", "privacy policy",
+                    ],
+                },
             ],
             guards=[
                 {
@@ -451,9 +507,23 @@ def _build_hardcoded_default() -> ScanConfig:
                         "open webui", "open-webui", "__gradio_mode__",
                         "gradio-app", "_stcore", "streamlit",
                     ],
-                    "downgrade_for_paths": ["/api/version"],
+                    "downgrade_for_paths": ["/api/version", "/v1/models"],
                 },
             ],
+            auth_suspect={
+                "status_codes": [401, 403],
+                "body_keywords": [
+                    "bearer", "api-key", "api_key", "openai", "llm",
+                ],
+                "exclude_body_patterns": [
+                    "<?xml",
+                    "<Code>AccessDenied</Code>",
+                    "InvalidSecurity",
+                    "SignatureDoesNotMatch",
+                    "NoSuchBucket",
+                    "InvalidAccessKeyId",
+                ],
+            },
         ),
         phase2=Phase2Config(tools=[
             Phase2ToolConfig(
@@ -463,10 +533,17 @@ def _build_hardcoded_default() -> ScanConfig:
                 supplements=[], version_from=None, requires_cached_ok=None,
             ),
             Phase2ToolConfig(
+                name="one-api", scope=["confirmed", "suspect"],
+                match={"source": "root", "type": "body_substring_any_ci",
+                       "values": ["One API", "New API"]},
+                supplements=[], version_from=None, requires_cached_ok=None,
+            ),
+            Phase2ToolConfig(
                 name="ollama", scope=["confirmed"],
                 match={"source": "cached:/api/tags", "type": "json_has_key",
                        "key": "models"},
-                supplements=[],
+                supplements=[{"source": "get:/api/tags", "type": "json_has_key",
+                              "key": "models"}],
                 version_from={"source": "cached_or_get:/api/version",
                               "type": "json_field", "field": "version"},
                 requires_cached_ok=None,
@@ -490,6 +567,20 @@ def _build_hardcoded_default() -> ScanConfig:
                 name="llama.cpp", scope=["confirmed"],
                 match={"source": "get:/props", "type": "body_substring",
                        "value": "default_generation_settings"},
+                supplements=[], version_from=None,
+                requires_cached_ok="/v1/models",
+            ),
+            Phase2ToolConfig(
+                name="sglang", scope=["confirmed"],
+                match={"source": "get:/get_server_info", "type": "body_substring_ci",
+                       "value": "sglang"},
+                supplements=[], version_from=None,
+                requires_cached_ok="/v1/models",
+            ),
+            Phase2ToolConfig(
+                name="litellm", scope=["confirmed"],
+                match={"source": "get:/model/info", "type": "body_substring_ci",
+                       "value": "litellm_params"},
                 supplements=[], version_from=None,
                 requires_cached_ok="/v1/models",
             ),
@@ -520,6 +611,12 @@ def _build_hardcoded_default() -> ScanConfig:
                 match={"type": "always"},
                 supplements=[], version_from=None,
                 requires_cached_ok="/v1/models",
+            ),
+            Phase2ToolConfig(
+                name="triton", scope=["confirmed"],
+                match={"source": "cached:/v2/models", "type": "json_has_key",
+                       "key": "models"},
+                supplements=[], version_from=None, requires_cached_ok=None,
             ),
             Phase2ToolConfig(
                 name="langserve", scope=["confirmed"],
@@ -575,6 +672,14 @@ def _build_hardcoded_default() -> ScanConfig:
                         "extract": {
                             "type": "error_regex",
                             "regex": '"([a-zA-Z0-9_\\-./: ]+)"',
+                            "context_patterns": [
+                                r'model["\s:=]+([a-zA-Z0-9_\-./]+)',
+                                r"model '([a-zA-Z0-9_\-./]+)'",
+                            ],
+                            "exclude_patterns": [
+                                "test", "your-model-id", "string", "null",
+                                "none", "example",
+                            ],
                             "filter": {"min_len": 3, "max_len": 80,
                                        "must_contain_any_char": ["/", ":", "-"]},
                         },
@@ -588,6 +693,14 @@ def _build_hardcoded_default() -> ScanConfig:
                         "extract": {
                             "type": "error_regex",
                             "regex": '"([a-zA-Z0-9_\\-./: ]+)"',
+                            "context_patterns": [
+                                r'model["\s:=]+([a-zA-Z0-9_\-./]+)',
+                                r"model '([a-zA-Z0-9_\-./]+)'",
+                            ],
+                            "exclude_patterns": [
+                                "test", "your-model-id", "string", "null",
+                                "none", "example",
+                            ],
                             "filter": {"min_len": 3, "max_len": 80,
                                        "must_contain_any_char": ["/", ":", "-"]},
                         },

@@ -30,6 +30,10 @@ phase0:
     - "* OK"      # IMAP greeting (authenticated)
     - "* BYE"     # IMAP goodbye
     - "220 "      # SMTP / FTP service ready (note trailing space)
+    - "RFB "      # VNC RFB protocol banner
+    - "\xff\xfd"  # Telnet IAC DO negotiation
+    - "\x4a\x00\x00\x00"  # MySQL initial greeting (packet length J + NUL×3)
+    - "N\x00\x00\x00"     # PostgreSQL startup message length prefix
 
   # Fraction of non-printable bytes in the first 512 bytes that triggers
   # "binary response" exclusion (databases, custom binary protocols).
@@ -42,11 +46,13 @@ phase1:
   # from the Phase 0 cache.  Stop probing once an API path confirms LLM.
   probe_paths:
     - /v1/models
+    - /api/v1/models       # reverse-proxy prefix variant (aliased to /v1/models)
+    - /openai/v1/models    # another common proxy prefix (aliased to /v1/models)
     - /api/tags
-    - /api/version
     - /info
     - /health
     - /docs
+    - /v2/models           # Triton/KServe v2 inference API
     - /
 
   # Confirm rules: each entry maps a probe path to the JSON/body condition
@@ -61,17 +67,31 @@ phase1:
           - { field: object, op: eq, value: list }
           - { field: data,   op: exists }
 
+    # Reverse-proxy prefix variants — aliased to /v1/models so Phase 2 tools
+    # with requires_cached_ok: /v1/models work without modification.
+    - path: /api/v1/models
+      when_status: 200
+      cache_also_as: /v1/models
+      match:
+        type: json_all
+        rules:
+          - { field: object, op: eq, value: list }
+          - { field: data,   op: exists }
+
+    - path: /openai/v1/models
+      when_status: 200
+      cache_also_as: /v1/models
+      match:
+        type: json_all
+        rules:
+          - { field: object, op: eq, value: list }
+          - { field: data,   op: exists }
+
     - path: /api/tags
       when_status: 200
       match:
         type: json_has_key
         key: models
-
-    - path: /api/version
-      when_status: 200
-      match:
-        type: json_has_key
-        key: version
 
     - path: /info
       when_status: 200
@@ -81,6 +101,12 @@ phase1:
 
     # /health: probed but no confirm rule defined here – intentionally omitted
     # (llama.cpp /health alone is too ambiguous; detected via /props in Phase 2)
+
+    - path: /v2/models
+      when_status: 200
+      match:
+        type: json_has_key
+        key: models
 
     - path: /docs
       when_status: any
@@ -100,10 +126,19 @@ phase1:
       - open-webui
       - __gradio_mode__
       - _stcore
-    # Additional compound predicate: body must contain ALL of these
+    # Additional compound predicate: body must contain ALL of these.
+    # exclude_if_contains prevents generic marketing pages from matching.
     extra_predicates:
       - type: body_all_substrings_ci
         values: [chat, model]
+        exclude_if_contains:
+          - "copyright"
+          - "terms of service"
+          - "privacy policy"
+          - "ng-model"    # AngularJS 数据绑定指令
+          - "ng-app"      # AngularJS 应用声明
+          - "v-model"     # Vue.js 数据绑定指令
+          - "x-model"     # Alpine.js 数据绑定指令
 
   # Guards: downgrade "确认" to "疑似" when the root page already shows a
   # frontend-only UI that makes the API signal ambiguous.
@@ -117,7 +152,29 @@ phase1:
         - "_stcore"
         - "streamlit"
       downgrade_for_paths:
-        - /api/version
+        - /v1/models      # OpenAI-compatible path can exist behind a frontend proxy
+
+  # Auth-gated suspects: if a probe returns 401/403 AND the response body
+  # contains any of these keywords, the target is marked 疑似 after the full
+  # probe loop (only when no path has already confirmed or suspected LLM).
+  auth_suspect:
+    status_codes: [401, 403]
+    body_keywords:
+      - bearer
+      - api-key
+      - api_key
+      - openai
+      - llm
+      # "authorization" removed: too generic — S3/MinIO 403 bodies always contain it
+    # If any of these strings appear in the body, skip the auth check entirely.
+    # Prevents S3/object-storage XML error pages from triggering false positives.
+    exclude_body_patterns:
+      - "<?xml"
+      - "<Code>AccessDenied</Code>"
+      - "InvalidSecurity"
+      - "SignatureDoesNotMatch"
+      - "NoSuchBucket"
+      - "InvalidAccessKeyId"
 
 
 # ── Phase 2 – Deploy tool identification ─────────────────────────────────────
@@ -142,6 +199,13 @@ phase2:
         type: body_substring_any_ci
         values: ["open webui", "open-webui"]
 
+    - name: one-api
+      scope: [confirmed, suspect]
+      match:
+        source: root
+        type: body_substring_any_ci
+        values: ["One API", "New API"]
+
     # ── API-based checks (confirmed only) ────────────────────────────────────
     - name: ollama
       scope: [confirmed]
@@ -149,6 +213,11 @@ phase2:
         source: "cached:/api/tags"
         type: json_has_key
         key: models
+      # If Phase 1 confirmed via /v1/models (not /api/tags), do a fresh GET
+      supplements:
+        - source: "get:/api/tags"
+          type: json_has_key
+          key: models
       # Fetch /api/version to populate deploy_version
       version_from:
         source: "cached_or_get:/api/version"
@@ -210,12 +279,36 @@ phase2:
         type: body_substring_any_ci
         values: [localai, "models/available"]
 
+    - name: sglang
+      scope: [confirmed]
+      requires_cached_ok: /v1/models
+      match:
+        source: "get:/get_server_info"
+        type: body_substring_ci
+        value: sglang
+
+    - name: litellm
+      scope: [confirmed]
+      requires_cached_ok: /v1/models
+      match:
+        source: "get:/model/info"
+        type: body_substring_ci
+        value: litellm_params
+
     # Fallback for any /v1/models-confirmed target that didn't match above
     - name: "未知-OpenAI兼容"
       scope: [confirmed]
       requires_cached_ok: /v1/models
       match:
         type: always
+
+    # Triton Inference Server / KServe v2 API — uses /v2/models cached from Phase 1
+    - name: triton
+      scope: [confirmed]
+      match:
+        source: "cached:/v2/models"
+        type: json_has_key
+        key: models
 
     - name: langserve
       scope: [confirmed]
@@ -291,6 +384,18 @@ phase3:
           type: error_regex
           # Captures quoted tokens; filter keeps likely model identifiers
           regex: '"([a-zA-Z0-9_\-./: ]+)"'
+          # context_patterns tried first — more precise extraction from error messages
+          context_patterns:
+            - 'model["\s:=]+([a-zA-Z0-9_\-./]+)'
+            - "model '([a-zA-Z0-9_\\-./]+)'"
+          # exclude_patterns blacklist known noisy placeholder/literal strings
+          exclude_patterns:
+            - test
+            - "your-model-id"
+            - string
+            - "null"
+            - none
+            - example
           filter:
             min_len: 3
             max_len: 80
@@ -307,6 +412,16 @@ phase3:
         extract:
           type: error_regex
           regex: '"([a-zA-Z0-9_\-./: ]+)"'
+          context_patterns:
+            - 'model["\s:=]+([a-zA-Z0-9_\-./]+)'
+            - "model '([a-zA-Z0-9_\\-./]+)'"
+          exclude_patterns:
+            - test
+            - "your-model-id"
+            - string
+            - "null"
+            - none
+            - example
           filter:
             min_len: 3
             max_len: 80

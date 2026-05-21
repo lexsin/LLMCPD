@@ -198,7 +198,9 @@ async def _phase0_single(
                     state.scan_time = _now()
                     return state
 
-            if is_binary(raw, p0.binary_threshold):
+            # Skip binary check when the response is a valid HTTP reply
+            # (e.g. gzip-encoded body starts with 0x1f 0x8b which looks binary).
+            if not raw.startswith(b"HTTP/") and is_binary(raw, p0.binary_threshold):
                 state.evidence.append("Phase0: binary response, non-HTTP")
                 state.scan_time = _now()
                 return state
@@ -230,16 +232,19 @@ async def phase0_protocol(
 # Phase 1 — LLM fingerprinting (config-driven)
 # ---------------------------------------------------------------------------
 
-def _phase1_check_confirmed(path: str, status: int, body: str, cfg: ScanConfig) -> bool:
-    """Return True if the path+response satisfies a confirm rule from config."""
+def _phase1_check_confirmed(
+    path: str, status: int, body: str, cfg: ScanConfig
+) -> Optional[Dict]:
+    """Return the matching confirm rule dict, or None if no rule matched."""
     for rule in cfg.phase1.confirm_rules:
         if rule.get("path") != path:
             continue
         when = rule.get("when_status", 200)
         if when != "any" and status != when:
             continue
-        return eval_match(rule["match"], body)
-    return False
+        if eval_match(rule["match"], body):
+            return rule
+    return None
 
 
 def _phase1_check_suspect(body: str, cfg: ScanConfig) -> bool:
@@ -263,6 +268,7 @@ async def _phase1_single(
     proto = state.protocol
     ip, port = state.ip, state.port
     rt = cfg.runtime.phase1
+    has_auth_signal = False
 
     async with sem:
         for path in cfg.phase1.probe_paths:
@@ -282,7 +288,21 @@ async def _phase1_single(
                 state.probes[path] = ProbeResult(status=status, body=body)
 
             if path != "/":
-                if _phase1_check_confirmed(path, status, body, cfg):
+                # Check for auth-gated LLM signal (401/403 with relevant keywords)
+                auth_cfg = cfg.phase1.auth_suspect
+                if auth_cfg and status in auth_cfg.get("status_codes", []):
+                    bl = body.lower()
+                    exclude_pats = auth_cfg.get("exclude_body_patterns", [])
+                    if not any(ep.lower() in bl for ep in exclude_pats):
+                        if any(kw in bl for kw in auth_cfg.get("body_keywords", [])):
+                            has_auth_signal = True
+
+                matched_rule = _phase1_check_confirmed(path, status, body, cfg)
+                if matched_rule is not None:
+                    # Store under alias path if rule specifies cache_also_as
+                    alias = matched_rule.get("cache_also_as")
+                    if alias and alias not in state.probes:
+                        state.probes[alias] = state.probes[path]
                     # Apply guards: downgrade "确认" to "疑似" for weak paths
                     root_pr = state.probes.get("/")
                     root_body = root_pr.body.lower() if root_pr and root_pr.status > 0 else ""
@@ -303,6 +323,11 @@ async def _phase1_single(
                 if _phase1_check_suspect(body, cfg):
                     state.is_llm = "疑似"
                     state.add_evidence("GET", "/", status, body)
+
+        # Auth-gated fallback: mark 疑似 only when no stronger signal found
+        if state.is_llm == "否" and has_auth_signal:
+            state.is_llm = "疑似"
+            state.evidence.append("Phase1: auth-gated response (401/403) with LLM keyword")
 
     return state
 
@@ -489,6 +514,19 @@ async def _phase2_single(
                 sup_pr = await resolve_source(sup_src)
                 if sup_pr and sup_pr.status > 0 and eval_match(sup, sup_pr.body):
                     record_match(tool.name, _source_path(sup_src), sup_pr)
+                    # Also attempt version_from after a supplement match
+                    if tool.version_from:
+                        vf = tool.version_from
+                        vf_src = vf.get("source", "")
+                        vpr = await resolve_source(vf_src)
+                        if vpr and vpr.status == 200:
+                            names = extract_models({"type": "json_field",
+                                                    "field": vf.get("field", "")},
+                                                   vpr.body)
+                            if names:
+                                state.deploy_version = names[0]
+                                state.add_evidence("GET", _source_path(vf_src),
+                                                   vpr.status, vpr.body)
                     return state
 
     return state
