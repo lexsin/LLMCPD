@@ -3,15 +3,18 @@
 """Batch LLM/inference-oriented port scan via nmap and merge open_ports into CSV."""
 
 import argparse
+import copy
 import csv
+import ipaddress
 import json
 import os
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 COL_UNIT = "\u63a5\u5165\u5355\u4f4d"
 COL_START = "\u8d77\u59cbIP"
@@ -94,6 +97,78 @@ def write_ip_list(path: Path, ips: List[str]) -> None:
             f.write(ip + "\n")
 
 
+def split_ips_by_version(ips: List[str]) -> Tuple[List[str], List[str]]:
+    v4: List[str] = []
+    v6: List[str] = []
+    for ip in ips:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            print("[WARN] invalid IP skipped: %s" % ip, file=sys.stderr)
+            continue
+        if addr.version == 6:
+            v6.append(ip)
+        else:
+            v4.append(ip)
+    return v4, v6
+
+
+def versioned_path(path: Path, tag: str) -> Path:
+    return path.parent / ("%s_%s%s" % (path.stem, tag, path.suffix))
+
+
+def format_elapsed(seconds: float) -> str:
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "%dh%02dm%02ds" % (h, m, s)
+    if m:
+        return "%dm%02ds" % (m, s)
+    return "%ds" % s
+
+
+def chunked(items: List[str], size: int) -> List[List[str]]:
+    if size <= 0:
+        return [items]
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def batch_path(base: Path, batch_idx: int) -> Path:
+    return base.parent / ("%s_batch_%04d%s" % (base.stem, batch_idx, base.suffix))
+
+
+def print_ip_progress(
+    prefix: str,
+    done_ips: int,
+    total_ips: int,
+    batch_idx: int,
+    batch_total: int,
+    t0: float,
+) -> None:
+    pct = (100.0 * done_ips / total_ips) if total_ips else 0.0
+    elapsed = time.monotonic() - t0
+    if done_ips > 0 and done_ips < total_ips:
+        eta = elapsed / done_ips * (total_ips - done_ips)
+        eta_s = format_elapsed(eta)
+    else:
+        eta_s = "-"
+    print(
+        "%sIP progress: %d/%d (%.1f%%) | batch %d/%d | elapsed %s | ETA %s"
+        % (
+            prefix,
+            done_ips,
+            total_ips,
+            pct,
+            batch_idx,
+            batch_total,
+            format_elapsed(elapsed),
+            eta_s,
+        ),
+        flush=True,
+    )
+
+
 def require_root() -> None:
     if os.geteuid() != 0:
         print(
@@ -104,7 +179,14 @@ def require_root() -> None:
         sys.exit(1)
 
 
-def run_nmap(ip_list_path: Path, xml_path: Path) -> None:
+def run_nmap_single(
+    ip_list_path: Path,
+    xml_path: Path,
+    *,
+    ipv6: bool = False,
+    stats_every: Optional[str] = "60s",
+    log_command: bool = True,
+) -> None:
     cmd = [
         "nmap",
         "-sS",
@@ -124,11 +206,164 @@ def run_nmap(ip_list_path: Path, xml_path: Path) -> None:
         "-oX",
         str(xml_path),
     ]
-    print("Running: %s" % " ".join(cmd))
+    if ipv6:
+        cmd.insert(1, "-6")
+    if stats_every:
+        cmd.extend(["--stats-every", stats_every])
+
+    if log_command:
+        print("  nmap: %s" % " ".join(cmd))
+
     result = subprocess.run(cmd, capture_output=False)
     if result.returncode != 0:
-        print("nmap exited with code %d" % result.returncode, file=sys.stderr)
+        print(
+            "  nmap batch failed (exit %d): %s"
+            % (result.returncode, xml_path),
+            file=sys.stderr,
+        )
         sys.exit(result.returncode)
+
+
+def merge_nmap_xml_files(batch_xml_paths: List[Path], out_path: Path) -> None:
+    """Combine per-batch nmap XML files into one output XML."""
+    root = ET.Element("nmaprun")
+    for batch_path in batch_xml_paths:
+        if not batch_path.is_file():
+            continue
+        try:
+            batch_root = ET.parse(batch_path).getroot()
+        except ET.ParseError:
+            continue
+        for host in batch_root.findall("host"):
+            root.append(copy.deepcopy(host))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
+
+
+def safe_parse_nmap_xml(xml_path: Path) -> Dict[str, str]:
+    """Like parse_nmap_xml but returns {} instead of sys.exit on missing/broken file."""
+    if not xml_path.is_file():
+        return {}
+    try:
+        return parse_nmap_xml(xml_path)
+    except SystemExit:
+        return {}
+
+
+def run_nmap_scan(
+    ips: List[str],
+    ip_list_path: Path,
+    xml_path: Path,
+    *,
+    ipv6: bool = False,
+    stats_every: Optional[str] = "60s",
+    step_label: str = "",
+    batch_size: int = 100,
+    keep_batch_files: bool = False,
+    on_batch_done: Optional[Callable[[Dict[str, str]], None]] = None,
+) -> None:
+    """
+    Scan `ips` in batches.
+
+    After each batch, `on_batch_done` is called with a dict of
+    {ip: open_ports_str} for every IP in that batch (empty string
+    means scanned but no open ports found).  Use this callback to
+    flush cache / rewrite CSV incrementally and support resume.
+    """
+    prefix = ("[%s] " % step_label) if step_label else ""
+    kind = "IPv6" if ipv6 else "IPv4"
+    total_ips = len(ips)
+
+    if total_ips == 0:
+        return
+
+    write_ip_list(ip_list_path, ips)
+    t0 = time.monotonic()
+
+    if batch_size <= 0 or total_ips <= batch_size:
+        print(
+            "%s%s scan: %d IPs (single run) -> %s"
+            % (prefix, kind, total_ips, xml_path)
+        )
+        if stats_every:
+            print("%s  nmap stats every %s" % (prefix, stats_every))
+        run_nmap_single(
+            ip_list_path,
+            xml_path,
+            ipv6=ipv6,
+            stats_every=stats_every,
+            log_command=True,
+        )
+        # Build full result: all IPs → "" default, overwrite with actual XML results
+        batch_result: Dict[str, str] = {ip: "" for ip in ips}
+        batch_result.update(safe_parse_nmap_xml(xml_path))
+        if on_batch_done:
+            on_batch_done(batch_result)
+        print_ip_progress(prefix, total_ips, total_ips, 1, 1, t0)
+        open_count = sum(1 for v in batch_result.values() if v)
+        print(
+            "%s%s done in %s | hosts with open ports: %d"
+            % (prefix, kind, format_elapsed(time.monotonic() - t0), open_count)
+        )
+        return
+
+    batches = chunked(ips, batch_size)
+    batch_total = len(batches)
+    print(
+        "%s%s scan: %d IPs in %d batches (batch_size=%d) -> %s"
+        % (prefix, kind, total_ips, batch_total, batch_size, xml_path)
+    )
+    if stats_every:
+        print("%s  nmap stats every %s (per batch)" % (prefix, stats_every))
+
+    batch_xml_paths: List[Path] = []
+    batch_list_paths: List[Path] = []
+    done_ips = 0
+
+    for batch_idx, batch_ips in enumerate(batches, start=1):
+        b_list = batch_path(ip_list_path, batch_idx)
+        b_xml = batch_path(xml_path, batch_idx)
+        batch_list_paths.append(b_list)
+        batch_xml_paths.append(b_xml)
+
+        write_ip_list(b_list, batch_ips)
+        print(
+            "%s  batch %d/%d: scanning %d IPs..."
+            % (prefix, batch_idx, batch_total, len(batch_ips)),
+            flush=True,
+        )
+        run_nmap_single(
+            b_list,
+            b_xml,
+            ipv6=ipv6,
+            stats_every=stats_every,
+            log_command=False,
+        )
+        done_ips += len(batch_ips)
+        print_ip_progress(prefix, done_ips, total_ips, batch_idx, batch_total, t0)
+
+        # Per-batch flush: mark all submitted IPs as scanned
+        batch_result = {ip: "" for ip in batch_ips}
+        batch_result.update(safe_parse_nmap_xml(b_xml))
+        if on_batch_done:
+            on_batch_done(batch_result)
+
+    print("%s  merging %d batch XML files..." % (prefix, len(batch_xml_paths)))
+    merge_nmap_xml_files(batch_xml_paths, xml_path)
+
+    if not keep_batch_files:
+        for p in batch_xml_paths + batch_list_paths:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    open_count = sum(1 for v in safe_parse_nmap_xml(xml_path).values() if v)
+    print(
+        "%s%s done in %s | IPs: %d | hosts with open ports: %d"
+        % (prefix, kind, format_elapsed(time.monotonic() - t0), total_ips, open_count)
+    )
 
 
 def parse_nmap_xml(xml_path: Path) -> Dict[str, str]:
@@ -162,6 +397,45 @@ def parse_nmap_xml(xml_path: Path) -> Dict[str, str]:
                         continue
 
         open_by_ip[ip] = PORT_SEP.join(str(p) for p in sorted(ports))
+
+    return open_by_ip
+
+
+def merge_nmap_xml_results(
+    v4_xml_path: Path,
+    v6_xml_path: Path,
+    legacy_xml_path: Path,
+    v4_ips: List[str],
+    v6_ips: List[str],
+    skip_scan: bool,
+) -> Optional[Dict[str, str]]:
+    """Load and merge IPv4/IPv6 scan XML. Returns None if required XML is missing."""
+    open_by_ip: Dict[str, str] = {}
+
+    if v4_xml_path.is_file():
+        open_by_ip.update(parse_nmap_xml(v4_xml_path))
+    elif legacy_xml_path.is_file():
+        open_by_ip.update(parse_nmap_xml(legacy_xml_path))
+    elif skip_scan and v4_ips:
+        print(
+            "--skip-scan: IPv4 XML not found: %s (legacy: %s)"
+            % (v4_xml_path, legacy_xml_path),
+            file=sys.stderr,
+        )
+        return None
+
+    if v6_xml_path.is_file():
+        open_by_ip.update(parse_nmap_xml(v6_xml_path))
+    elif skip_scan and v6_ips:
+        print(
+            "--skip-scan: IPv6 XML not found: %s" % v6_xml_path,
+            file=sys.stderr,
+        )
+        return None
+
+    if skip_scan and not open_by_ip and (v4_ips or v6_ips):
+        print("No scan XML found for --skip-scan", file=sys.stderr)
+        return None
 
     return open_by_ip
 
@@ -210,6 +484,10 @@ def merge_results(
     return output
 
 
+def default_output_path(input_path: Path) -> Path:
+    return input_path.parent / ("%s_scan_result%s" % (input_path.stem, input_path.suffix))
+
+
 def print_stats(rows: List[dict]) -> None:
     with_ports = sum(1 for r in rows if r[COL_OPEN_PORTS])
     port_counter: Counter = Counter()
@@ -235,20 +513,62 @@ def main() -> int:
         description="Nmap LLM/inference port scan and CSV open_ports merge"
     )
     parser.add_argument("--input", default="IPs_1_result.csv")
-    parser.add_argument("--output", default="IPs_1_result_scan.csv")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output CSV (default: same dir as input, {stem}_scan_result{suffix})",
+    )
     parser.add_argument("--xml", default="scan.xml")
     parser.add_argument("--ip-list", default="ips_scan.txt")
     parser.add_argument("--cache", default="port_scan_cache.json")
     parser.add_argument("--skip-scan", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--stats-every",
+        default="60s",
+        help="nmap --stats-every interval for progress (default 60s); use 0 to disable",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=100,
+        help="IPs per nmap batch for IP-level progress (default 100); 0 = all in one run",
+    )
+    parser.add_argument(
+        "--keep-batch-files",
+        action="store_true",
+        help="Keep per-batch ip list and XML files after merge",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip IPs already recorded in cache and continue from last checkpoint",
+    )
     args = parser.parse_args()
+    stats_every: Optional[str] = args.stats_every
+    if stats_every in ("0", ""):
+        stats_every = None
 
     base_dir = Path(__file__).resolve().parent
-    input_path = base_dir / args.input
-    output_path = base_dir / args.output
+    raw_input = Path(args.input)
+    input_path = raw_input if raw_input.is_absolute() else base_dir / raw_input
+
+    if args.output is None:
+        output_path = default_output_path(input_path)
+    else:
+        raw_output = Path(args.output)
+        output_path = raw_output if raw_output.is_absolute() else base_dir / raw_output
+
     xml_path = base_dir / args.xml
+    v4_xml_path = versioned_path(xml_path, "v4")
+    v6_xml_path = versioned_path(xml_path, "v6")
     ip_list_path = base_dir / args.ip_list
+    v4_list_path = versioned_path(ip_list_path, "v4")
+    v6_list_path = versioned_path(ip_list_path, "v6")
     cache_path = base_dir / args.cache
+
+    print("Input:  %s" % input_path)
+    print("Output: %s" % output_path)
 
     if not input_path.is_file():
         print("Input not found: %s" % input_path, file=sys.stderr)
@@ -265,23 +585,115 @@ def main() -> int:
         return 1
 
     ips = extract_unique_ips(rows, args.limit)
-    print("Unique IPs to scan: %d" % len(ips))
+    v4_ips, v6_ips = split_ips_by_version(ips)
+    total_all = len(v4_ips) + len(v6_ips)
+    print(
+        "Unique IPs: %d (IPv4: %d, IPv6: %d)"
+        % (total_all, len(v4_ips), len(v6_ips))
+    )
     write_ip_list(ip_list_path, ips)
+
+    # Load cache early — used by both resume filtering and the flush callback
+    cache = load_cache(cache_path)
+
+    if args.resume and cache:
+        already_done = set(cache.keys())
+        v4_before, v6_before = len(v4_ips), len(v6_ips)
+        v4_ips = [ip for ip in v4_ips if ip not in already_done]
+        v6_ips = [ip for ip in v6_ips if ip not in already_done]
+        skipped = (v4_before - len(v4_ips)) + (v6_before - len(v6_ips))
+        print(
+            "Resume: %d IPs already in cache (skipped), %d remaining"
+            % (skipped, len(v4_ips) + len(v6_ips))
+        )
+
+    pipeline_t0 = time.monotonic()
+
+    # --- Per-batch flush callback -------------------------------------------
+    # Called after every nmap batch with {ip: open_ports_str} for all IPs in
+    # that batch (empty string = scanned, no open ports found).
+    # Updates cache, saves to disk, and rewrites the output CSV immediately.
+    def flush_batch(batch_result: Dict[str, str]) -> None:
+        cache.update(batch_result)
+        save_cache(cache_path, cache)
+        output_rows_tmp = merge_results(rows, cache)
+        with output_path.open("w", encoding="utf-8-sig", newline="") as fout:
+            w = csv.DictWriter(
+                fout, fieldnames=FIELDNAMES, quoting=csv.QUOTE_NONNUMERIC
+            )
+            w.writeheader()
+            w.writerows(output_rows_tmp)
+        with_ports = sum(1 for r in output_rows_tmp if r[COL_OPEN_PORTS])
+        print(
+            "  [checkpoint] +%d IPs flushed | cache: %d total | "
+            "CSV: %d rows (%d with ports) -> %s"
+            % (
+                len(batch_result),
+                len(cache),
+                len(output_rows_tmp),
+                with_ports,
+                output_path,
+            ),
+            flush=True,
+        )
+    # -------------------------------------------------------------------------
 
     if not args.skip_scan:
         require_root()
-        run_nmap(ip_list_path, xml_path)
-    elif not xml_path.is_file():
-        print("--skip-scan set but XML missing: %s" % xml_path, file=sys.stderr)
+        scan_steps: List[Tuple[str, List[str], Path, Path, bool]] = []
+        if v4_ips:
+            scan_steps.append(("IPv4", v4_ips, v4_list_path, v4_xml_path, False))
+        if v6_ips:
+            scan_steps.append(("IPv6", v6_ips, v6_list_path, v6_xml_path, True))
+
+        if not scan_steps:
+            if args.resume:
+                print("All IPs already in cache — nothing to scan.")
+            else:
+                print("No valid IPs to scan", file=sys.stderr)
+                return 1
+
+        total_steps = len(scan_steps)
+        for idx, (kind, targets, list_path, out_xml, is_v6) in enumerate(
+            scan_steps, start=1
+        ):
+            run_nmap_scan(
+                targets,
+                list_path,
+                out_xml,
+                ipv6=is_v6,
+                stats_every=stats_every,
+                step_label="%d/%d %s" % (idx, total_steps, kind),
+                batch_size=args.batch_size,
+                keep_batch_files=args.keep_batch_files,
+                on_batch_done=flush_batch,
+            )
+    elif not v4_ips and not v6_ips and not args.resume:
+        print("No valid IPs to scan", file=sys.stderr)
         return 1
 
-    open_by_ip = parse_nmap_xml(xml_path)
-    print("Hosts with open ports in XML: %d" % sum(1 for v in open_by_ip.values() if v))
+    # Final pass: merge XML results for --skip-scan path (no flush_batch ran)
+    if args.skip_scan:
+        print("Merging scan results from XML...")
+        open_by_ip = merge_nmap_xml_results(
+            v4_xml_path,
+            v6_xml_path,
+            xml_path,
+            v4_ips,
+            v6_ips,
+            args.skip_scan,
+        )
+        if open_by_ip is None:
+            return 1
+        print(
+            "Merged: %d hosts with open ports / %d targets"
+            % (sum(1 for v in open_by_ip.values() if v), len(v4_ips) + len(v6_ips))
+        )
+        cache.update(open_by_ip)
+        save_cache(cache_path, cache)
 
-    cache = load_cache(cache_path)
-    cache.update(open_by_ip)
-    save_cache(cache_path, cache)
-
+    # Write final CSV (covers --skip-scan and any resumed-but-unchanged rows)
+    print("Writing final CSV (%d rows)..." % len(rows))
     output_rows = merge_results(rows, cache)
     with output_path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(
@@ -294,6 +706,7 @@ def main() -> int:
 
     print("Wrote %d rows -> %s" % (len(output_rows), output_path))
     print_stats(output_rows)
+    print("Total elapsed: %s" % format_elapsed(time.monotonic() - pipeline_t0))
     return 0
 
 

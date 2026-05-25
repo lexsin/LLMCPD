@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Expand IP ranges from CSV and ping each address (Windows)."""
+"""Expand IP ranges from CSV/XLS and ping each address."""
 
 import argparse
 import csv
@@ -13,10 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 DEFAULT_MAX_EXPAND = 256
-COL_UNIT = "\u63a5\u5165\u5355\u4f4d"
-COL_START = "\u8d77\u59cbIP"
-COL_END = "\u7ec8\u6b62IP"
-FIELDNAMES = [COL_UNIT, COL_START, COL_END, "ip", "ping"]
+INPUT_SUFFIXES = (".csv", ".xls", ".xlsx")
 
 
 def expand_range(
@@ -41,17 +38,26 @@ def ping_one(ip: str, timeout_sec: float) -> str:
     except ValueError:
         return "error"
 
-    if addr.version == 6:
-        cmd = ["ping", "-6", "-n", "1", "-w", str(timeout_ms), ip]
+    if sys.platform == "win32":
+        if addr.version == 6:
+            cmd = ["ping", "-6", "-n", "1", "-w", str(timeout_ms), ip]
+        else:
+            cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
+        encoding = "gbk"
     else:
-        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
+        wait_sec = max(1, int(timeout_sec))
+        if addr.version == 6:
+            cmd = ["ping", "-6", "-c", "1", "-W", str(wait_sec), ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(wait_sec), ip]
+        encoding = "utf-8"
 
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            encoding="gbk",
+            encoding=encoding,
             errors="replace",
             timeout=timeout_sec + 1,
         )
@@ -91,15 +97,57 @@ def read_csv_rows(path: Path) -> List[dict]:
         try:
             with path.open(encoding=encoding, newline="") as f:
                 rows = list(csv.DictReader(f))
-            print("Input encoding: %s" % encoding)
+            print("  encoding: %s" % encoding)
             return rows
         except UnicodeDecodeError:
             continue
     raise UnicodeDecodeError("csv", b"", 0, 1, "unsupported encoding")
 
 
+def read_excel_rows(path: Path) -> List[dict]:
+    try:
+        import pandas as pd
+    except ImportError:
+        print(
+            "pandas required for Excel. Run: pip install pandas xlrd openpyxl",
+            file=sys.stderr,
+        )
+        raise
+
+    engine = "xlrd" if path.suffix.lower() == ".xls" else None
+    df = pd.read_excel(path, engine=engine)
+    df = df.where(df.notna(), "")
+    rows = df.astype(str).to_dict(orient="records")
+    # strip whitespace in string fields
+    for row in rows:
+        for k, v in list(row.items()):
+            if isinstance(v, str):
+                row[k] = v.strip()
+    return rows
+
+
+def read_input_rows(path: Path) -> List[dict]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return read_csv_rows(path)
+    if suffix in (".xls", ".xlsx"):
+        return read_excel_rows(path)
+    raise ValueError("unsupported file type: %s" % path.suffix)
+
+
+def output_fieldnames(col_unit: Optional[str], col_start: str, col_end: str) -> List[str]:
+    names: List[str] = []
+    if col_unit:
+        names.append(col_unit)
+    names.extend([col_start, col_end, "ip", "ping"])
+    return names
+
+
 def collect_unique_ips(
     rows: List[dict],
+    col_start: str,
+    col_end: str,
+    col_unit: Optional[str],
     limit: Optional[int],
     max_expand: int = DEFAULT_MAX_EXPAND,
 ) -> Tuple[List[dict], Set[str]]:
@@ -110,8 +158,16 @@ def collect_unique_ips(
         if limit is not None and idx >= limit:
             break
 
-        start_ip = row[COL_START].strip()
-        end_ip = row[COL_END].strip()
+        start_ip = str(row.get(col_start, "")).strip()
+        end_ip = str(row.get(col_end, "")).strip()
+        if not start_ip or not end_ip:
+            print(
+                "[WARN] row %d: missing %s or %s, skipped"
+                % (idx + 2, col_start, col_end),
+                file=sys.stderr,
+            )
+            continue
+
         try:
             ips, truncated = expand_range(start_ip, end_ip, max_expand)
         except ValueError as exc:
@@ -125,14 +181,14 @@ def collect_unique_ips(
                 file=sys.stderr,
             )
 
-        processed.append(
-            {
-                COL_UNIT: row[COL_UNIT],
-                COL_START: start_ip,
-                COL_END: end_ip,
-                "ips": ips,
-            }
-        )
+        item: Dict = {
+            col_start: start_ip,
+            col_end: end_ip,
+            "ips": ips,
+        }
+        if col_unit:
+            item[col_unit] = str(row.get(col_unit, "")).strip()
+        processed.append(item)
         unique_ips.update(ips)
 
     return processed, unique_ips
@@ -150,7 +206,7 @@ def ping_all(
     if not pending:
         return cache
 
-    print("Ping targets: %d (cached: %d)" % (total, len(ips) - total))
+    print("  ping targets: %d (cached: %d)" % (total, len(ips) - total))
     done = 0
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -165,7 +221,7 @@ def ping_all(
                 cache[ip] = "error"
             done += 1
             if done % 100 == 0 or done == total:
-                print("  Ping progress: %d/%d" % (done, total))
+                print("  ping progress: %d/%d" % (done, total))
                 save_cache(cache_path, cache)
 
     save_cache(cache_path, cache)
@@ -175,23 +231,28 @@ def ping_all(
 def build_output_rows(
     processed: List[dict],
     cache: Dict[str, str],
+    col_start: str,
+    col_end: str,
+    col_unit: Optional[str],
     max_expand: int = DEFAULT_MAX_EXPAND,
+    ping_default: str = "error",
 ) -> List[dict]:
     output: List[dict] = []
     for item in processed:
-        base = {
-            COL_UNIT: item[COL_UNIT],
-            COL_START: item[COL_START],
-            COL_END: item[COL_END],
+        base: Dict[str, str] = {
+            col_start: item[col_start],
+            col_end: item[col_end],
         }
+        if col_unit:
+            base[col_unit] = item.get(col_unit, "")
+
         ips: List[str] = item["ips"]
-        pings = [cache.get(ip, "error") for ip in ips]
+        pings = [cache.get(ip, ping_default) for ip in ips]
 
         if len(ips) <= max_expand:
             for ip, status in zip(ips, pings):
                 output.append(dict(base, ip=ip, ping=status))
         else:
-            # Only when a segment still has more than max_expand addresses after truncation
             output.append(
                 dict(
                     base,
@@ -202,14 +263,161 @@ def build_output_rows(
     return output
 
 
+def list_input_files(data_dir: Path) -> List[Path]:
+    files = sorted(
+        p for p in data_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in INPUT_SUFFIXES
+    )
+    return files
+
+
+def resolve_inputs(path: Path) -> Tuple[List[Path], Path]:
+    """
+    Accept a directory or a single CSV/XLS file.
+    Returns (input_files, default_output_directory).
+    """
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    if path.is_file():
+        if path.suffix.lower() not in INPUT_SUFFIXES:
+            raise ValueError(
+                "unsupported file type %s (supported: %s)"
+                % (path.suffix, ", ".join(INPUT_SUFFIXES))
+            )
+        return [path.resolve()], path.parent.resolve()
+
+    if path.is_dir():
+        files = list_input_files(path)
+        if not files:
+            raise ValueError(
+                "no CSV/XLS files in %s (suffixes: %s)"
+                % (path, ", ".join(INPUT_SUFFIXES))
+            )
+        return files, path.resolve()
+
+    raise FileNotFoundError(path)
+
+
+def process_file(
+    input_path: Path,
+    output_path: Path,
+    col_start: str,
+    col_end: str,
+    col_unit: Optional[str],
+    cache: Dict[str, str],
+    cache_path: Path,
+    workers: int,
+    timeout_sec: float,
+    limit: Optional[int],
+    max_expand: int,
+    skip_ping: bool = False,
+) -> Tuple[int, Dict[str, str]]:
+    print("\n=== %s ===" % input_path.name)
+
+    try:
+        rows = read_input_rows(input_path)
+    except UnicodeDecodeError:
+        print("  cannot decode file", file=sys.stderr)
+        return 1, cache
+    except Exception as exc:
+        print("  read failed: %s" % exc, file=sys.stderr)
+        return 1, cache
+
+    if not rows:
+        print("  empty input, skipped", file=sys.stderr)
+        return 1, cache
+
+    if col_start not in rows[0] or col_end not in rows[0]:
+        print(
+            "  columns not found (need %s, %s); got: %s"
+            % (col_start, col_end, list(rows[0].keys())),
+            file=sys.stderr,
+        )
+        return 1, cache
+
+    print("  rows: %d (max_expand=%d)" % (len(rows), max_expand))
+    processed, unique_ips = collect_unique_ips(
+        rows, col_start, col_end, col_unit, limit, max_expand
+    )
+    print("  segments: %d, unique IPs: %d" % (len(processed), len(unique_ips)))
+
+    if not processed:
+        print("  no valid segments, skipped", file=sys.stderr)
+        return 1, cache
+
+    if skip_ping:
+        print("  ping: skipped (--skip-ping)")
+        ping_cache = cache
+    else:
+        ping_cache = ping_all(unique_ips, cache, workers, timeout_sec, cache_path)
+
+    output_rows = build_output_rows(
+        processed,
+        ping_cache,
+        col_start,
+        col_end,
+        col_unit,
+        max_expand,
+        ping_default="" if skip_ping else "error",
+    )
+
+    fieldnames = output_fieldnames(col_unit, col_start, col_end)
+    with output_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(output_rows)
+
+    print("  wrote %d rows -> %s" % (len(output_rows), output_path))
+    if not skip_ping:
+        success = sum(1 for ip in unique_ips if ping_cache.get(ip) == "success")
+        print("  ping: success=%d, error=%d" % (success, len(unique_ips) - success))
+    return 0, ping_cache
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="IP range expand and ping check")
-    parser.add_argument("--input", default="IPs_1.csv")
-    parser.add_argument("--output", default="IPs_1_result.csv")
+    parser = argparse.ArgumentParser(
+        description="Expand IP ranges and ping check for files under data/"
+    )
+    parser.add_argument(
+        "--data-dir",
+        default="data",
+        help="Input directory or single CSV/XLS file (default: data)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory (default: input file's parent, or --data-dir if directory)",
+    )
+    parser.add_argument(
+        "--col-start",
+        default="START_IP",
+        help="Column name for range start IP (default: START_IP)",
+    )
+    parser.add_argument(
+        "--col-end",
+        default="END_IP",
+        help="Column name for range end IP (default: END_IP)",
+    )
+    parser.add_argument(
+        "--col-unit",
+        default=None,
+        help="Optional column name for unit/org (omitted from output if unset)",
+    )
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--timeout", type=float, default=4.0)
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max source rows per file (for testing)",
+    )
     parser.add_argument("--cache", default="ping_cache.json")
+    parser.add_argument(
+        "--skip-ping",
+        action="store_true",
+        help="Only expand IP ranges; do not ping (ping column left empty)",
+    )
     parser.add_argument(
         "--max-expand",
         type=int,
@@ -217,47 +425,70 @@ def main() -> int:
         help="Max addresses to enumerate per segment (default 256)",
     )
     args = parser.parse_args()
-    max_expand = args.max_expand
 
     base_dir = Path(__file__).resolve().parent
-    input_path = base_dir / args.input
-    output_path = base_dir / args.output
+    raw_input = Path(args.data_dir)
+    input_root = raw_input if raw_input.is_absolute() else base_dir / raw_input
     cache_path = base_dir / args.cache
 
-    if not input_path.is_file():
-        print("Input not found: %s" % input_path, file=sys.stderr)
-        return 1
-
     try:
-        rows = read_csv_rows(input_path)
-    except UnicodeDecodeError:
-        print("Cannot decode input CSV", file=sys.stderr)
+        input_files, default_output_dir = resolve_inputs(input_root)
+    except FileNotFoundError:
+        print("Input not found: %s" % input_root, file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
 
-    if not rows:
-        print("Empty input CSV", file=sys.stderr)
-        return 1
+    if args.output_dir:
+        raw_out = Path(args.output_dir)
+        output_dir = raw_out if raw_out.is_absolute() else base_dir / raw_out
+    else:
+        output_dir = default_output_dir
 
-    print(
-        "Read %d source rows (max_expand=%d, one row per IP)"
-        % (len(rows), max_expand)
-    )
-    processed, unique_ips = collect_unique_ips(rows, args.limit, max_expand)
-    print("Valid segments: %d, unique IPs: %d" % (len(processed), len(unique_ips)))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cache = {} if args.skip_ping else load_cache(cache_path)
 
-    cache = load_cache(cache_path)
-    cache = ping_all(unique_ips, cache, args.workers, args.timeout, cache_path)
+    print("Input: %s" % input_root)
+    print("Output dir: %s" % output_dir)
+    print("Columns: start=%s, end=%s" % (args.col_start, args.col_end))
+    if args.skip_ping:
+        print("Ping: disabled (--skip-ping)")
+    if args.col_unit:
+        print("Unit column: %s" % args.col_unit)
+    print("Files to process: %d" % len(input_files))
 
-    output_rows = build_output_rows(processed, cache, max_expand)
-    with output_path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(output_rows)
+    failed = 0
+    for input_path in input_files:
+        output_path = output_dir / ("%s_result.csv" % input_path.stem)
+        rc, cache = process_file(
+            input_path=input_path,
+            output_path=output_path,
+            col_start=args.col_start,
+            col_end=args.col_end,
+            col_unit=args.col_unit,
+            cache=cache,
+            cache_path=cache_path,
+            workers=args.workers,
+            timeout_sec=args.timeout,
+            limit=args.limit,
+            max_expand=args.max_expand,
+            skip_ping=args.skip_ping,
+        )
+        if rc != 0:
+            failed += 1
 
-    print("Wrote %d rows -> %s" % (len(output_rows), output_path))
-    success = sum(1 for v in cache.values() if v == "success")
-    print("Ping stats: success=%d, error=%d" % (success, len(cache) - success))
-    return 0
+    print("\n=== Summary ===")
+    print("Processed: %d, failed: %d" % (len(input_files), failed))
+    if args.skip_ping:
+        print("Ping: disabled (not run, cache not updated)")
+    else:
+        success_total = sum(1 for v in cache.values() if v == "success")
+        print("Cache: %s (%d IPs)" % (cache_path, len(cache)))
+        print("Ping cache stats: success=%d, error=%d" % (
+            success_total, len(cache) - success_total
+        ))
+    return 1 if failed == len(input_files) else 0
 
 
 if __name__ == "__main__":
