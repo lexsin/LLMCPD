@@ -263,6 +263,43 @@ def build_output_rows(
     return output
 
 
+def build_output_rows_dedup(
+    processed: List[dict],
+    cache: Dict[str, str],
+    col_start: str,
+    col_end: str,
+    col_unit: Optional[str],
+    ping_default: str = "error",
+) -> List[dict]:
+    """One output row per unique IP; first segment wins for start/end/unit metadata."""
+    first_meta: Dict[str, Dict[str, str]] = {}
+    order: List[str] = []
+
+    for item in processed:
+        base: Dict[str, str] = {
+            col_start: item[col_start],
+            col_end: item[col_end],
+        }
+        if col_unit:
+            base[col_unit] = item.get(col_unit, "")
+
+        for ip in item["ips"]:
+            if ip in first_meta:
+                continue
+            first_meta[ip] = dict(base)
+            order.append(ip)
+
+    output: List[dict] = []
+    for ip in order:
+        row = dict(first_meta[ip], ip=ip, ping=cache.get(ip, ping_default))
+        output.append(row)
+    return output
+
+
+def count_expanded_ips(processed: List[dict]) -> int:
+    return sum(len(item["ips"]) for item in processed)
+
+
 def list_input_files(data_dir: Path) -> List[Path]:
     files = sorted(
         p for p in data_dir.iterdir()
@@ -312,6 +349,7 @@ def process_file(
     limit: Optional[int],
     max_expand: int,
     skip_ping: bool = False,
+    dedup_ip: bool = False,
 ) -> Tuple[int, Dict[str, str]]:
     print("\n=== %s ===" % input_path.name)
 
@@ -340,7 +378,13 @@ def process_file(
     processed, unique_ips = collect_unique_ips(
         rows, col_start, col_end, col_unit, limit, max_expand
     )
-    print("  segments: %d, unique IPs: %d" % (len(processed), len(unique_ips)))
+    expanded_total = count_expanded_ips(processed)
+    print(
+        "  segments: %d, expanded IPs: %d, unique IPs: %d"
+        % (len(processed), expanded_total, len(unique_ips))
+    )
+    if dedup_ip:
+        print("  output: deduplicated (--dedup-ip), %d rows" % len(unique_ips))
 
     if not processed:
         print("  no valid segments, skipped", file=sys.stderr)
@@ -352,15 +396,26 @@ def process_file(
     else:
         ping_cache = ping_all(unique_ips, cache, workers, timeout_sec, cache_path)
 
-    output_rows = build_output_rows(
-        processed,
-        ping_cache,
-        col_start,
-        col_end,
-        col_unit,
-        max_expand,
-        ping_default="" if skip_ping else "error",
-    )
+    ping_default = "" if skip_ping else "error"
+    if dedup_ip:
+        output_rows = build_output_rows_dedup(
+            processed,
+            ping_cache,
+            col_start,
+            col_end,
+            col_unit,
+            ping_default=ping_default,
+        )
+    else:
+        output_rows = build_output_rows(
+            processed,
+            ping_cache,
+            col_start,
+            col_end,
+            col_unit,
+            max_expand,
+            ping_default=ping_default,
+        )
 
     fieldnames = output_fieldnames(col_unit, col_start, col_end)
     with output_path.open("w", encoding="utf-8-sig", newline="") as f:
@@ -424,6 +479,11 @@ def main() -> int:
         default=DEFAULT_MAX_EXPAND,
         help="Max addresses to enumerate per segment (default 256)",
     )
+    parser.add_argument(
+        "--dedup-ip",
+        action="store_true",
+        help="After expand, output one row per unique IP (drop duplicate rows)",
+    )
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent
@@ -454,6 +514,8 @@ def main() -> int:
     print("Columns: start=%s, end=%s" % (args.col_start, args.col_end))
     if args.skip_ping:
         print("Ping: disabled (--skip-ping)")
+    if args.dedup_ip:
+        print("Output: one row per unique IP (--dedup-ip)")
     if args.col_unit:
         print("Unit column: %s" % args.col_unit)
     print("Files to process: %d" % len(input_files))
@@ -474,6 +536,7 @@ def main() -> int:
             limit=args.limit,
             max_expand=args.max_expand,
             skip_ping=args.skip_ping,
+            dedup_ip=args.dedup_ip,
         )
         if rc != 0:
             failed += 1
