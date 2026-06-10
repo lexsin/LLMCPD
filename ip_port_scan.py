@@ -4,6 +4,7 @@
 
 import argparse
 import copy
+import ctypes
 import csv
 import ipaddress
 import json
@@ -171,13 +172,31 @@ def print_ip_progress(
 
 
 def require_root() -> None:
-    if os.geteuid() != 0:
+    if sys.platform == "win32":
+        try:
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            is_admin = False
+        if not is_admin:
+            print(
+                "SYN scan (-sS) requires Administrator. "
+                "Re-run in an elevated (Administrator) command prompt.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    elif hasattr(os, "geteuid"):
+        if os.geteuid() != 0:
+            print(
+                "SYN scan (-sS) requires root. Run: sudo python3 %s ..."
+                % Path(__file__).name,
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
         print(
-            "SYN scan (-sS) requires root. Run: sudo python3 %s ..."
-            % Path(__file__).name,
+            "[WARN] Cannot determine privilege level on this platform; proceeding anyway.",
             file=sys.stderr,
         )
-        sys.exit(1)
 
 
 def run_nmap_single(
@@ -629,11 +648,14 @@ def _verify_ports_sv(
     ports_str: str,
     tmp_dir: Path,
     stats_every: Optional[str],
+    proc_timeout: int = 120,
 ) -> str:
     """Re-scan a single IP with -sV --version-intensity 0 on its already-open ports.
 
     Returns a new semicolon-separated port string with tcpwrapped ports removed.
     Temporary files are written to tmp_dir and deleted after parsing.
+    proc_timeout: Python-level wall-clock timeout (seconds) for the nmap subprocess.
+    On timeout, returns the original ports_str unchanged.
     """
     ports_csv = ports_str.replace(PORT_SEP, ",")
     safe_ip = ip.replace(":", "_")
@@ -659,7 +681,20 @@ def _verify_ports_sv(
     ]
     if stats_every:
         cmd.extend(["--stats-every", stats_every])
-    subprocess.run(cmd, capture_output=True)
+    print("  [verify] %s: running -sV on %d ports..." % (ip, len(ports_str.split(PORT_SEP))), flush=True)
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=proc_timeout)
+    except subprocess.TimeoutExpired:
+        print(
+            "  [verify] %s: -sV timed out after %ds, keeping original SYN result" % (ip, proc_timeout),
+            flush=True,
+        )
+        for p in (list_path, xml_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        return ports_str
     result = parse_nmap_xml_sv(xml_path, exclude_tcpwrapped=True)
     for p in (list_path, xml_path):
         try:

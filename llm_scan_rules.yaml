@@ -3,18 +3,18 @@ version: 1
 # ── Runtime parameters ────────────────────────────────────────────────────────
 runtime:
   phase0:
-    concurrency: 500
+    concurrency: 50
     timeout: 3       # seconds per connection attempt
     retries: 1       # retry count on timeout
   phase1:
-    concurrency: 300
+    concurrency: 30
     timeout: 5
   phase2:
-    concurrency: 200
+    concurrency: 20
     timeout: 5
     max_extra_gets: 3   # budget for additional GETs per target in Phase 2
   phase3:
-    concurrency: 100
+    concurrency: 10
     timeout: 10
     retries: 1
 
@@ -129,6 +129,10 @@ phase1:
     # Additional compound predicate: body must contain ALL of these.
     # exclude_if_contains prevents generic marketing pages from matching.
     extra_predicates:
+      - type: body_all_substrings_ci
+        values:
+          - "<title>dify</title>"
+          - "/_next/static/"
       - type: body_all_substrings_ci
         values: [chat, model]
         exclude_if_contains:
