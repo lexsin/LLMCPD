@@ -93,28 +93,24 @@ python3 ip_ping_check.py --data-dir data/990000762670.xls --col-start START_IP -
 
 # 只展开 IP，不 ping（供后续直接端口扫描）
 python3 ip_ping_check.py --data-dir data/990000762670.xls --col-start START_IP --col-end END_IP --skip-ping
-
-# 展开后按 IP 去重（多段重复 IP 只保留一行，适合直接给 ip_port_scan）
-python3 ip_ping_check.py --data-dir data/990000762670.xls --col-start START_IP --col-end END_IP --skip-ping --dedup-ip
 ```
 
 ### 参数
 
 
-| 参数             | 默认                | 说明                     |
-| -------------- | ----------------- | ---------------------- |
-| `--data-dir`   | `data`            | 输入目录或单个文件              |
-| `--output-dir` | 与输入同目录            | 输出目录                   |
-| `--col-start`  | `START_IP`        | 起始 IP 列名               |
-| `--col-end`    | `END_IP`          | 终止 IP 列名               |
-| `--col-unit`   | 无                 | 可选单位列，写入输出             |
-| `--skip-ping`  | 关                 | 跳过 ping，`ping` 列为空     |
-| `--dedup-ip`   | 关                 | 展开后对 IP 去重，每个 IP 只输出一行 |
-| `--workers`    | `32`              | ping 并发线程数             |
-| `--timeout`    | `4.0`             | 单次 ping 超时（秒）          |
-| `--limit`      | 无                 | 每个文件只处理前 N 行源数据        |
-| `--max-expand` | `256`             | 单段最多展开地址数，超出只保留首尾      |
-| `--cache`      | `ping_cache.json` | ping 结果缓存              |
+| 参数             | 默认                | 说明                 |
+| -------------- | ----------------- | ------------------ |
+| `--data-dir`   | `data`            | 输入目录或单个文件          |
+| `--output-dir` | 与输入同目录            | 输出目录               |
+| `--col-start`  | `START_IP`        | 起始 IP 列名           |
+| `--col-end`    | `END_IP`          | 终止 IP 列名           |
+| `--col-unit`   | 无                 | 可选单位列，写入输出         |
+| `--skip-ping`  | 关                 | 跳过 ping，`ping` 列为空 |
+| `--workers`    | `32`              | ping 并发线程数         |
+| `--timeout`    | `4.0`             | 单次 ping 超时（秒）      |
+| `--limit`      | 无                 | 每个文件只处理前 N 行源数据    |
+| `--max-expand` | `256`             | 单段最多展开地址数，超出只保留首尾  |
+| `--cache`      | `ping_cache.json` | ping 结果缓存          |
 
 
 ---
@@ -123,20 +119,19 @@ python3 ip_ping_check.py --data-dir data/990000762670.xls --col-start START_IP -
 
 对 CSV 中 **每个唯一 IP** 用 nmap 扫描 **488 个指定端口**（非全端口），将开放端口写入 `open_ports`（分号分隔）。
 
-- **IPv4 / IPv6 自动分扫**：IPv6 使用 `nmap -6`（两段串行：先 v4 再 v6）
+- **IPv4 / IPv6 自动分扫**：IPv6 使用 `nmap -6`
 - **分批扫描**：默认每批 100 IP，打印 IP 级进度与 ETA
 - **每批落盘**：每批完成后更新 `port_scan_cache.json` 并重写输出 CSV
-- `**--resume`**：跳过 cache 中已有记录，继续未扫 IP
-- **多批并行**：`--parallel-workers N` 用进程池同时跑多批 nmap；落盘仍在主线程串行（与 resume 兼容）
+- `**--resume`**：跳过 cache 中已有记录，继续未扫 IP（**仅认 `port_scan_cache.json`**，不读 `scan_v4_batch_*.xml`）
 
 ### 输入
 
-- CSV 需含列 `**ip`**（通常来自 `*_result.csv`）
+- CSV 需含列 `**ip**`（通常来自 `*_result.csv`）
 
 ### 输出
 
 - 默认与输入同目录：`{输入文件名}_scan_result.csv`
-- 在原有列基础上增加/更新 `**open_ports`**
+- 在原有列基础上增加/更新 `**open_ports**`
 
 ### 常用命令
 
@@ -152,41 +147,39 @@ sudo python3 ip_port_scan.py \
   --input data/990000762670_result.csv \
   --output data/990000762670_scan_result.csv \
   --batch-size 200
-
-# 多批并行（建议先试 2，观察网络/机器负载）
-sudo python3 ip_port_scan.py \
-  --input data/990000762670_result.csv \
-  --batch-size 100 \
-  --parallel-workers 2 \
-  --resume
 ```
 
 ### 参数
 
 
-| 参数                   | 默认                       | 说明                                       |
-| -------------------- | ------------------------ | ---------------------------------------- |
-| `--input`            | `IPs_1_result.csv`       | 输入 CSV                                   |
-| `--output`           | `{stem}_scan_result.csv` | 输出 CSV（默认同目录）                            |
-| `--xml`              | `scan.xml`               | 派生 `scan_v4.xml`、`scan_v6.xml`           |
-| `--ip-list`          | `ips_scan.txt`           | 全量 IP 列表备份                               |
-| `--cache`            | `port_scan_cache.json`   | 端口结果缓存（断点依据）                             |
-| `--batch-size`       | `100`                    | 每批 IP 数；`0` 表示不分批                        |
-| `--parallel-workers` | `1`                      | 并行 nmap 批次数；建议 2~4                       |
-| `--merge-xml`        | 见说明                      | 强制合并批次 XML；默认 workers=1 合并，workers>1 不合并 |
-| `--resume`           | 关                        | 跳过 cache 中已有 IP                          |
-| `--stats-every`      | `60s`                    | nmap 进度统计间隔；`0` 关闭                       |
-| `--skip-scan`        | 关                        | 不跑 nmap，仅从已有 XML 合并                      |
-| `--keep-batch-files` | 关                        | 保留 `scan_v4_batch_*.xml` 等               |
-| `--limit`            | 无                        | 只取前 N 个唯一 IP                             |
+| 参数                   | 默认                       | 说明                             |
+| -------------------- | ------------------------ | ------------------------------ |
+| `--input`            | `IPs_1_result.csv`       | 输入 CSV                         |
+| `--output`           | `{stem}_scan_result.csv` | 输出 CSV（默认同目录）                  |
+| `--xml`              | `scan.xml`               | 派生 `scan_v4.xml`、`scan_v6.xml` |
+| `--ip-list`          | `ips_scan.txt`           | 全量 IP 列表备份                     |
+| `--cache`            | `port_scan_cache.json`   | 端口结果缓存（断点依据）                   |
+| `--batch-size`       | `100`                    | 每批 IP 数；`0` 表示不分批              |
+| `--resume`           | 关                        | 跳过 cache 中已有 IP                |
+| `--stats-every`      | `60s`                    | nmap 进度统计间隔；`0` 关闭             |
+| `--skip-scan`        | 关                        | 不跑 nmap，仅从已有 XML 合并            |
+| `--keep-batch-files` | 关                        | 保留 `scan_v4_batch_*.xml` 等     |
+| `--limit`            | 无                        | 只取前 N 个唯一 IP                   |
 
 
 ### 注意
 
-- 必须使用 **sudo**（SYN 扫描）；并行子进程继承 root
+- 必须使用 **sudo**（SYN 扫描）
 - 扫描端口数量固定为 **488**（见脚本内 `SCAN_PORTS`）
-- 中断后：cache 与 CSV 在每批结束后已更新，可用 `**--resume`** 继续
-- `**--parallel-workers > 1`** 提高瞬时 SYN 压力；默认跳过大批量 XML 合并，需要时加 `**--merge-xml**`
+- 中断后：cache 与 CSV 在每批结束后已更新，可用 `**--resume`** 继续；IPv4 已全部在 cache 时只会扫剩余 IPv6
+- `**--resume` 只根据 cache 跳过 IP**，不会根据磁盘上的 `scan_v4_batch_*.xml` / `ips_scan_v4_batch_*.txt` 断点。若 cache 条数明显少于已产生的 batch 文件（例如并行中断后 cache 被覆盖），需先用 `**rebuild_port_cache.py`** 从 batch 重建 cache，再 `--resume` 补扫剩余 IP
+
+```bash
+# 从 batch 产物重建 cache，并刷新输出 CSV（不跑 nmap）
+python3 rebuild_port_cache.py \
+  --input data/ty_result.csv \
+  --output data/ty_result_scan_result.csv
+```
 
 ---
 
@@ -345,19 +338,18 @@ sudo python3 ip_full_port_scan.py \
 ```bash
 cd /home/lx
 
-# 1) IP地址段展开 IP
+# 1) 展开 IP（跳过 ping，加快进入端口扫描）
 python3 ip_ping_check.py \
   --data-dir data/990000762670.xls \
   --col-start START_IP --col-end END_IP \
-  --skip-ping \
-  --dedup-ip
+  --skip-ping
 
 # 2) 端口扫描（中断后用 --resume 续扫，例如补 IPv6）
 sudo python3 ip_port_scan.py \
   --input data/990000762670_result.csv \
-  --batch-size 100 \ #分批次扫描，每批次数量
-  --parallel-workers 2 \ #线程数
-  --resume #断点需扫标识
+  --batch-size 100 \
+  --parallel-workers 2 \
+  --resume
 
 # 3) 展开端口，供 LLM 扫描
 python3 expand_scan_ports.py \
@@ -368,7 +360,7 @@ python3 expand_scan_ports.py \
 python3 scan_llm.py \
   --input      data/990000762670_expanded.csv \
   --output     data/990000762670_llm.csv \
-  --checkpoint data/990000762670_llm_checkpoint.jsonl \ #指定断点需扫checkpoint文件
+  --checkpoint data/990000762670_llm_checkpoint.jsonl \
   --resume
 ```
 

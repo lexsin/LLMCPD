@@ -108,6 +108,8 @@ def make_ssl_ctx() -> ssl.SSLContext:
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
+_SSL_CTX = make_ssl_ctx()
+
 
 async def fetch(
     session: aiohttp.ClientSession,
@@ -119,8 +121,13 @@ async def fetch(
     """Return (status, raw_bytes, error_str). Never raises."""
     try:
         kwargs: dict = {
-            "timeout": aiohttp.ClientTimeout(total=timeout),
-            "ssl": make_ssl_ctx(),
+            "timeout": aiohttp.ClientTimeout(
+                total=timeout,
+                connect=min(5, timeout),
+                sock_connect=min(5, timeout),
+                sock_read=timeout,
+            ),
+            "ssl": _SSL_CTX,
             "allow_redirects": True,
         }
         if json_body is not None:
@@ -221,7 +228,10 @@ async def phase0_protocol(
     targets: List[Tuple[str, str]], concurrency: int, cfg: ScanConfig
 ) -> List[TargetState]:
     sem = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(limit=concurrency, ssl=False)
+    connector = aiohttp.TCPConnector(
+        limit=concurrency, ssl=False,
+        enable_cleanup_closed=True, keepalive_timeout=30,
+    )
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [_phase0_single(sem, session, ip, port, cfg) for ip, port in targets]
         states = await asyncio.gather(*tasks)
@@ -336,7 +346,10 @@ async def phase1_fingerprint(
     http_alive: List[TargetState], concurrency: int, cfg: ScanConfig
 ) -> List[TargetState]:
     sem = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(limit=concurrency, ssl=False)
+    connector = aiohttp.TCPConnector(
+        limit=concurrency, ssl=False,
+        enable_cleanup_closed=True, keepalive_timeout=30,
+    )
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [_phase1_single(sem, session, s, cfg) for s in http_alive]
         states = await asyncio.gather(*tasks)
@@ -536,7 +549,10 @@ async def phase2_deploy(
     confirmed: List[TargetState], concurrency: int, cfg: ScanConfig
 ) -> List[TargetState]:
     sem = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(limit=concurrency, ssl=False)
+    connector = aiohttp.TCPConnector(
+        limit=concurrency, ssl=False,
+        enable_cleanup_closed=True, keepalive_timeout=30,
+    )
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [_phase2_single(sem, session, s, cfg) for s in confirmed]
         states = await asyncio.gather(*tasks)
@@ -609,7 +625,10 @@ async def phase3_model(
     llm_targets: List[TargetState], concurrency: int, cfg: ScanConfig
 ) -> List[TargetState]:
     sem = asyncio.Semaphore(concurrency)
-    connector = aiohttp.TCPConnector(limit=concurrency, ssl=False)
+    connector = aiohttp.TCPConnector(
+        limit=concurrency, ssl=False,
+        enable_cleanup_closed=True, keepalive_timeout=30,
+    )
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [_phase3_single(sem, session, s, cfg) for s in llm_targets]
         states = await asyncio.gather(*tasks)

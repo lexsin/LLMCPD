@@ -9,12 +9,13 @@ import csv
 import ipaddress
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -29,6 +30,7 @@ COL_PING = "ping"
 # Semicolon separator avoids Excel treating "80,443" as one number with thousand separators
 PORT_SEP = ";"
 FIELDNAMES = [COL_UNIT, COL_START, COL_END, COL_IP, COL_OPEN_PORTS, COL_PING]
+INTERRUPTED = False
 
 # ~488 ports: user list + legacy HTTP ports + LLM/inference/vector-DB extras
 SCAN_PORTS = (
@@ -97,6 +99,19 @@ def write_ip_list(path: Path, ips: List[str]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for ip in ips:
             f.write(ip + "\n")
+
+
+def _handle_interrupt(signum, _frame) -> None:
+    global INTERRUPTED
+    INTERRUPTED = True
+    raise KeyboardInterrupt
+
+
+def install_signal_handlers() -> None:
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            signal.signal(sig, _handle_interrupt)
 
 
 def split_ips_by_version(ips: List[str]) -> Tuple[List[str], List[str]]:
@@ -331,11 +346,10 @@ def merge_nmap_xml_files(batch_xml_paths: List[Path], out_path: Path) -> None:
 
 def safe_parse_nmap_xml(xml_path: Path) -> Dict[str, str]:
     """Like parse_nmap_xml but returns {} instead of sys.exit on missing/broken file."""
-    if not xml_path.is_file():
-        return {}
     try:
         return parse_nmap_xml(xml_path)
-    except SystemExit:
+    except (FileNotFoundError, ET.ParseError, RuntimeError, OSError) as exc:
+        print("[WARN] cannot parse nmap XML %s: %s" % (xml_path, exc), file=sys.stderr)
         return {}
 
 
@@ -416,7 +430,8 @@ def run_nmap_scan(
         b_xml = batch_path(xml_path, batch_idx)
         batch_list_paths.append(b_list)
         batch_xml_paths.append(b_xml)
-        write_ip_list(b_list, batch_ips)
+        if parallel_workers <= 1:
+            write_ip_list(b_list, batch_ips)
         jobs.append(
             (
                 batch_idx,
@@ -499,8 +514,7 @@ def run_nmap_scan(
 
 def parse_nmap_xml(xml_path: Path) -> Dict[str, str]:
     if not xml_path.is_file():
-        print("XML not found: %s" % xml_path, file=sys.stderr)
-        sys.exit(1)
+        raise FileNotFoundError("XML not found: %s" % xml_path)
 
     tree = ET.parse(xml_path)
     root = tree.getroot()
@@ -544,7 +558,7 @@ def parse_nmap_xml_sv(xml_path: Path, exclude_tcpwrapped: bool = True) -> Dict[s
     try:
         tree = ET.parse(xml_path)
     except ET.ParseError:
-        return {}
+        raise RuntimeError("broken -sV XML: %s" % xml_path)
     root = tree.getroot()
     open_by_ip: Dict[str, str] = {}
 
@@ -591,9 +605,9 @@ def merge_nmap_xml_results(
     open_by_ip: Dict[str, str] = {}
 
     if v4_xml_path.is_file():
-        open_by_ip.update(parse_nmap_xml(v4_xml_path))
+        open_by_ip.update(safe_parse_nmap_xml(v4_xml_path))
     elif legacy_xml_path.is_file():
-        open_by_ip.update(parse_nmap_xml(legacy_xml_path))
+        open_by_ip.update(safe_parse_nmap_xml(legacy_xml_path))
     elif skip_scan and v4_ips:
         print(
             "--skip-scan: IPv4 XML not found: %s (legacy: %s)"
@@ -603,7 +617,7 @@ def merge_nmap_xml_results(
         return None
 
     if v6_xml_path.is_file():
-        open_by_ip.update(parse_nmap_xml(v6_xml_path))
+        open_by_ip.update(safe_parse_nmap_xml(v6_xml_path))
     elif skip_scan and v6_ips:
         print(
             "--skip-scan: IPv6 XML not found: %s" % v6_xml_path,
@@ -639,8 +653,25 @@ def load_cache(path: Path) -> Dict[str, str]:
 
 
 def save_cache(path: Path, cache: Dict[str, str]) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=0)
+    tmp_path = path.with_name(path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, separators=(",", ":"))
+    tmp_path.replace(path)
+
+
+def append_checkpoint(path: Path, batch_result: Dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scan_time = time.strftime("%Y-%m-%d %H:%M:%S")
+    with path.open("a", encoding="utf-8") as f:
+        for ip, ports in sorted(batch_result.items()):
+            f.write(
+                json.dumps(
+                    {"ip": ip, "open_ports": ports, "scan_time": scan_time},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
 
 
 def _verify_ports_sv(
@@ -683,7 +714,7 @@ def _verify_ports_sv(
         cmd.extend(["--stats-every", stats_every])
     print("  [verify] %s: running -sV on %d ports..." % (ip, len(ports_str.split(PORT_SEP))), flush=True)
     try:
-        subprocess.run(cmd, capture_output=True, timeout=proc_timeout)
+        proc = subprocess.run(cmd, capture_output=True, timeout=proc_timeout)
     except subprocess.TimeoutExpired:
         print(
             "  [verify] %s: -sV timed out after %ds, keeping original SYN result" % (ip, proc_timeout),
@@ -695,13 +726,90 @@ def _verify_ports_sv(
             except OSError:
                 pass
         return ports_str
-    result = parse_nmap_xml_sv(xml_path, exclude_tcpwrapped=True)
+    if proc.returncode != 0:
+        print(
+            "  [verify] %s: -sV failed (exit %d), keeping original SYN result"
+            % (ip, proc.returncode),
+            flush=True,
+        )
+        for p in (list_path, xml_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        return ports_str
+    if not xml_path.is_file():
+        print(
+            "  [verify] %s: -sV XML missing, keeping original SYN result" % ip,
+            flush=True,
+        )
+        for p in (list_path, xml_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        return ports_str
+    try:
+        result = parse_nmap_xml_sv(xml_path, exclude_tcpwrapped=True)
+    except RuntimeError as exc:
+        print("  [verify] %s: %s, keeping original SYN result" % (ip, exc), flush=True)
+        result = {ip: ports_str}
     for p in (list_path, xml_path):
         try:
             p.unlink()
         except OSError:
             pass
     return result.get(ip, "")
+
+
+def verify_anomalous_ports(
+    batch_result: Dict[str, str],
+    anomaly_threshold: int,
+    tmp_dir: Path,
+    stats_every: Optional[str],
+    verify_workers: int,
+) -> None:
+    if anomaly_threshold <= 0:
+        return
+    anomalous = [
+        (ip, ports_str)
+        for ip, ports_str in batch_result.items()
+        if ports_str and len(ports_str.split(PORT_SEP)) > anomaly_threshold
+    ]
+    if not anomalous:
+        return
+
+    workers = max(1, min(verify_workers, len(anomalous)))
+    print(
+        "  [verify] %d anomalous IPs, workers=%d" % (len(anomalous), workers),
+        flush=True,
+    )
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_verify_ports_sv, ip, ports_str, tmp_dir, stats_every): (
+                ip,
+                ports_str,
+            )
+            for ip, ports_str in anomalous
+        }
+        for fut in as_completed(futures):
+            ip, ports_str = futures[fut]
+            try:
+                verified = fut.result()
+            except Exception as exc:
+                print(
+                    "  [verify] %s: verification failed (%s), keeping original SYN result"
+                    % (ip, exc),
+                    flush=True,
+                )
+                verified = ports_str
+            verified_count = len(verified.split(PORT_SEP)) if verified else 0
+            print(
+                "  [verify] %s: %d ports (SYN) -> %d ports (sV)"
+                % (ip, len(ports_str.split(PORT_SEP)), verified_count),
+                flush=True,
+            )
+            batch_result[ip] = verified
 
 
 def _cleanup_tmp_files(tmp_dir: Path, paths: List[Path]) -> None:
@@ -774,6 +882,7 @@ def main() -> int:
     parser.add_argument("--xml", default="scan.xml")
     parser.add_argument("--ip-list", default="ips_scan.txt")
     parser.add_argument("--cache", default="port_scan_cache.json")
+    parser.add_argument("--checkpoint", default="port_scan_checkpoint.jsonl")
     parser.add_argument("--skip-scan", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
@@ -819,10 +928,20 @@ def main() -> int:
         default=20,
         help="Re-verify with -sV --version-intensity 0 if open port count exceeds this (default 20; 0 = disable)",
     )
+    parser.add_argument(
+        "--verify-workers",
+        type=int,
+        default=4,
+        help="Parallel -sV verification workers for anomalous IPs (default 4)",
+    )
     args = parser.parse_args()
     if args.parallel_workers < 1:
         print("--parallel-workers must be >= 1", file=sys.stderr)
         return 1
+    if args.verify_workers < 1:
+        print("--verify-workers must be >= 1", file=sys.stderr)
+        return 1
+    install_signal_handlers()
     stats_every: Optional[str] = args.stats_every
     if stats_every in ("0", ""):
         stats_every = None
@@ -847,6 +966,7 @@ def main() -> int:
     v4_list_path = versioned_path(ip_list_path, "v4")
     v6_list_path = versioned_path(ip_list_path, "v6")
     cache_path = base_dir / args.cache
+    checkpoint_path = base_dir / args.checkpoint
 
     merge_xml = args.merge_xml or (args.parallel_workers <= 1)
 
@@ -900,39 +1020,27 @@ def main() -> int:
     # --- Per-batch flush callback -------------------------------------------
     # Called after every nmap batch with {ip: open_ports_str} for all IPs in
     # that batch (empty string = scanned, no open ports found).
-    # Updates cache, saves to disk, and rewrites the output CSV immediately.
+    # Updates cache and appends a compact checkpoint; final CSV is written once.
     def flush_batch(batch_result: Dict[str, str]) -> None:
-        if anomaly_threshold > 0:
-            for ip, ports_str in list(batch_result.items()):
-                count = len(ports_str.split(PORT_SEP)) if ports_str else 0
-                if count > anomaly_threshold:
-                    verified = _verify_ports_sv(ip, ports_str, tmp_dir, stats_every)
-                    verified_count = len(verified.split(PORT_SEP)) if verified else 0
-                    print(
-                        "  [verify] %s: %d ports (SYN) -> %d ports (sV)"
-                        % (ip, count, verified_count),
-                        flush=True,
-                    )
-                    batch_result[ip] = verified
+        verify_anomalous_ports(
+            batch_result,
+            anomaly_threshold,
+            tmp_dir,
+            stats_every,
+            args.verify_workers,
+        )
         cache.update(batch_result)
         save_cache(cache_path, cache)
-        output_rows_tmp = merge_results(rows, cache)
-        with output_path.open("w", encoding="utf-8-sig", newline="") as fout:
-            w = csv.DictWriter(
-                fout, fieldnames=FIELDNAMES, quoting=csv.QUOTE_NONNUMERIC
-            )
-            w.writeheader()
-            w.writerows(output_rows_tmp)
-        with_ports = sum(1 for r in output_rows_tmp if r[COL_OPEN_PORTS])
+        append_checkpoint(checkpoint_path, batch_result)
+        with_ports = sum(1 for v in cache.values() if v)
         print(
             "  [checkpoint] +%d IPs flushed | cache: %d total | "
-            "CSV: %d rows (%d with ports) -> %s"
+            "%d with ports | checkpoint -> %s"
             % (
                 len(batch_result),
                 len(cache),
-                len(output_rows_tmp),
                 with_ports,
-                output_path,
+                checkpoint_path,
             ),
             flush=True,
         )
@@ -957,19 +1065,28 @@ def main() -> int:
         for idx, (kind, targets, list_path, out_xml, is_v6) in enumerate(
             scan_steps, start=1
         ):
-            run_nmap_scan(
-                targets,
-                list_path,
-                out_xml,
-                ipv6=is_v6,
-                stats_every=stats_every,
-                step_label="%d/%d %s" % (idx, total_steps, kind),
-                batch_size=args.batch_size,
-                keep_batch_files=args.keep_batch_files,
-                on_batch_done=flush_batch,
-                parallel_workers=args.parallel_workers,
-                merge_xml=merge_xml,
-            )
+            try:
+                run_nmap_scan(
+                    targets,
+                    list_path,
+                    out_xml,
+                    ipv6=is_v6,
+                    stats_every=stats_every,
+                    step_label="%d/%d %s" % (idx, total_steps, kind),
+                    batch_size=args.batch_size,
+                    keep_batch_files=args.keep_batch_files,
+                    on_batch_done=flush_batch,
+                    parallel_workers=args.parallel_workers,
+                    merge_xml=merge_xml,
+                )
+            except KeyboardInterrupt:
+                save_cache(cache_path, cache)
+                print(
+                    "\nInterrupted. Cache saved to %s; resume with --resume."
+                    % cache_path,
+                    file=sys.stderr,
+                )
+                return 130
     elif not v4_ips and not v6_ips and not args.resume:
         print("No valid IPs to scan", file=sys.stderr)
         return 1
