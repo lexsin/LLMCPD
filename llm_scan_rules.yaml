@@ -131,6 +131,10 @@ phase1:
         values:
           - "<title>dify</title>"
           - "/_next/static/"
+      # Generic AI/model serving endpoints, e.g.
+      # {"model_class":"YOLOv8Model","status":"UP"}
+      - type: json_has_key
+        key: model_class
 
   # Optional SPA/JS-bundle suspect detection.  This does not execute JS; it
   # fetches a small number of same-origin bundle files referenced by "/" and
@@ -287,6 +291,13 @@ phase2:
         type: body_substring_any_ci
         values: ["One API", "New API"]
 
+    - name: "AI算力服务"
+      scope: [suspect]
+      match:
+        source: root
+        type: json_has_key
+        key: model_class
+
     # ── API-based checks (confirmed only) ────────────────────────────────────
     - name: ollama
       scope: [confirmed]
@@ -427,6 +438,11 @@ phase2:
 phase3:
   # Cached GET responses checked in priority order before any new requests.
   cache_sources:
+    - path: /
+      extract:
+        type: json_field
+        field: model_class
+
     - path: /v1/models
       extract:
         type: json_list_field
