@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 try:
     import aiohttp
@@ -117,6 +118,7 @@ async def fetch(
     url: str,
     timeout: int,
     json_body: Optional[dict] = None,
+    allow_redirects: bool = True,
 ) -> Tuple[int, bytes, str]:
     """Return (status, raw_bytes, error_str). Never raises."""
     try:
@@ -128,7 +130,7 @@ async def fetch(
                 sock_read=timeout,
             ),
             "ssl": _SSL_CTX,
-            "allow_redirects": True,
+            "allow_redirects": allow_redirects,
         }
         if json_body is not None:
             kwargs["json"] = json_body
@@ -269,6 +271,102 @@ def _phase1_check_suspect(body: str, cfg: ScanConfig) -> bool:
     return False
 
 
+def _extract_script_srcs(html: str) -> List[str]:
+    srcs: List[str] = []
+    pattern = re.compile(
+        r"<script\b[^>]*\bsrc\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^>\s]+))",
+        re.I,
+    )
+    for m in pattern.finditer(html):
+        src = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+        if src:
+            srcs.append(src)
+    return srcs
+
+
+def _same_origin_url(base: str, src: str) -> Optional[str]:
+    joined = urljoin(base, src)
+    bp = urlparse(base)
+    jp = urlparse(joined)
+    if jp.scheme != bp.scheme or jp.netloc != bp.netloc:
+        return None
+    return joined
+
+
+def _js_src_allowed(src: str, cfg: Dict) -> bool:
+    low = src.lower()
+    patterns = cfg.get("include_src_patterns", [])
+    return any(str(p).lower() in low for p in patterns)
+
+
+def _match_js_bundle(body: str, cfg: Dict) -> Optional[str]:
+    low = body.lower()
+    if any(str(kw).lower() in low for kw in cfg.get("exclude_keywords", [])):
+        return None
+
+    for kw in cfg.get("api_path_keywords", []):
+        kw_s = str(kw)
+        if kw_s.lower() in low:
+            return kw_s
+
+    semantic = next(
+        (str(kw) for kw in cfg.get("semantic_keywords", []) if str(kw).lower() in low),
+        "",
+    )
+    chat = next(
+        (str(kw) for kw in cfg.get("chat_keywords", []) if str(kw).lower() in low),
+        "",
+    )
+    if semantic and chat:
+        return "%s+%s" % (semantic, chat)
+    return None
+
+
+async def _phase1_check_js_bundle(
+    session: aiohttp.ClientSession,
+    state: TargetState,
+    cfg: ScanConfig,
+) -> Optional[str]:
+    js_cfg = cfg.phase1.js_bundle_suspect or {}
+    if not js_cfg.get("enabled", False):
+        return None
+
+    root = state.probes.get("/")
+    if not root or root.status <= 0:
+        return None
+    html = root.body or ""
+    if "<script" not in html.lower():
+        return None
+
+    base = base_url(state.protocol, state.ip, state.port) + "/"
+    max_scripts = int(js_cfg.get("max_scripts", 3))
+    max_bytes = int(js_cfg.get("max_bytes", BODY_LIMIT))
+    timeout = cfg.runtime.phase1.timeout
+    seen = set()
+    checked = 0
+    for src in _extract_script_srcs(html):
+        if checked >= max_scripts:
+            break
+        if not _js_src_allowed(src, js_cfg):
+            continue
+        url = _same_origin_url(base, src)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        checked += 1
+        status, raw, err = await fetch(
+            session, "GET", url, timeout, allow_redirects=False
+        )
+        if status != 200 or not raw:
+            continue
+        body = decode_body(raw[:max_bytes])
+        matched = _match_js_bundle(body, js_cfg)
+        if matched:
+            path = urlparse(url).path or src
+            return "Phase1 JS bundle suspect: %s matched=%s" % (path, matched)
+    return None
+
+
 async def _phase1_single(
     sem: asyncio.Semaphore,
     session: aiohttp.ClientSession,
@@ -333,6 +431,12 @@ async def _phase1_single(
                 if _phase1_check_suspect(body, cfg):
                     state.is_llm = "疑似"
                     state.add_evidence("GET", "/", status, body)
+
+        if state.is_llm == "否":
+            js_evidence = await _phase1_check_js_bundle(session, state, cfg)
+            if js_evidence:
+                state.is_llm = "疑似"
+                state.evidence.append(js_evidence)
 
         # Auth-gated fallback: mark 疑似 only when no stronger signal found
         if state.is_llm == "否" and has_auth_signal:

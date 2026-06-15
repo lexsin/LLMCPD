@@ -269,6 +269,7 @@ class Phase1Config:
     suspect_predicates: List[Dict]
     guards: List[Dict]
     auth_suspect: Optional[Dict] = None  # {status_codes: [...], body_keywords: [...]}
+    js_bundle_suspect: Dict = field(default_factory=dict)
 
 
 @dataclass
@@ -349,6 +350,7 @@ def _parse_phase1(d: dict) -> Phase1Config:
         suspect_predicates=suspect.get("extra_predicates", []),
         guards=p.get("guards", []),
         auth_suspect=p.get("auth_suspect"),
+        js_bundle_suspect=p.get("js_bundle_suspect", {}),
     )
 
 
@@ -524,6 +526,7 @@ def _build_hardcoded_default() -> ScanConfig:
                     "InvalidAccessKeyId",
                 ],
             },
+            js_bundle_suspect={"enabled": False},
         ),
         phase2=Phase2Config(tools=[
             Phase2ToolConfig(

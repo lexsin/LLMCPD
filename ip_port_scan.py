@@ -16,6 +16,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -31,6 +32,7 @@ COL_PING = "ping"
 PORT_SEP = ";"
 FIELDNAMES = [COL_UNIT, COL_START, COL_END, COL_IP, COL_OPEN_PORTS, COL_PING]
 INTERRUPTED = False
+BatchCallback = Callable[[int, Dict[str, str]], None]
 
 # ~488 ports: user list + legacy HTTP ports + LLM/inference/vector-DB extras
 SCAN_PORTS = (
@@ -69,6 +71,25 @@ SCAN_PORTS = (
 )
 
 
+@dataclass
+class NmapOptions:
+    ports: str = SCAN_PORTS
+    min_rate: str = "5000"
+    max_retries: str = "1"
+    host_timeout: str = "180s"
+
+
+@dataclass
+class LowOpenConfirmConfig:
+    enabled: bool
+    rate_threshold: float
+    min_open_ips: int
+    sample_size: int
+    expand_rate_threshold: float
+    extra_ports: str
+    nmap_options: NmapOptions
+
+
 def read_csv_rows(path: Path) -> List[dict]:
     for encoding in ("utf-8-sig", "gbk", "utf-8"):
         try:
@@ -99,6 +120,41 @@ def write_ip_list(path: Path, ips: List[str]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for ip in ips:
             f.write(ip + "\n")
+
+
+def normalize_ports_spec(value: str) -> str:
+    return ",".join(
+        p.strip()
+        for p in value.replace("\n", ",").replace(";", ",").split(",")
+        if p.strip()
+    )
+
+
+def load_ports_spec(ports: Optional[str], ports_file: Optional[str], base_dir: Path) -> str:
+    parts: List[str] = []
+    if ports:
+        parts.append(ports)
+    if ports_file:
+        path = Path(ports_file)
+        if not path.is_absolute():
+            path = base_dir / path
+        with path.open(encoding="utf-8") as f:
+            parts.append(f.read())
+    return normalize_ports_spec(",".join(parts))
+
+
+def merge_ports_str(existing: str, added: str) -> str:
+    ports: Set[int] = set()
+    for value in (existing, added):
+        for p in normalize_ports_str(value).split(PORT_SEP):
+            p = p.strip()
+            if not p:
+                continue
+            try:
+                ports.add(int(p))
+            except ValueError:
+                continue
+    return PORT_SEP.join(str(p) for p in sorted(ports))
 
 
 def _handle_interrupt(signum, _frame) -> None:
@@ -222,26 +278,28 @@ def run_nmap_single(
     stats_every: Optional[str] = "60s",
     log_command: bool = True,
     exit_on_fail: bool = True,
+    nmap_options: Optional[NmapOptions] = None,
 ) -> None:
+    opts = nmap_options or NmapOptions()
     cmd = [
         "nmap",
         "-sS",
         "-n",
         "-T4",
-        "--min-rate",
-        "5000",
-        "--max-retries",
-        "1",
-        "--host-timeout",
-        "180s",
         "--open",
         "-p",
-        SCAN_PORTS,
+        opts.ports,
         "-iL",
         str(ip_list_path),
         "-oX",
         str(xml_path),
     ]
+    if opts.min_rate:
+        cmd[4:4] = ["--min-rate", opts.min_rate]
+    if opts.max_retries:
+        cmd[4:4] = ["--max-retries", opts.max_retries]
+    if opts.host_timeout:
+        cmd[4:4] = ["--host-timeout", opts.host_timeout]
     if ipv6:
         cmd.insert(1, "-6")
     if stats_every:
@@ -266,6 +324,7 @@ def _run_batch_job(
     b_xml: str,
     ipv6: bool,
     stats_every: Optional[str],
+    nmap_options: NmapOptions,
 ) -> Tuple[int, Dict[str, str]]:
     """Process-pool worker: run one nmap batch and return scan results."""
     write_ip_list(Path(b_list), batch_ips)
@@ -276,6 +335,7 @@ def _run_batch_job(
         stats_every=stats_every,
         log_command=False,
         exit_on_fail=False,
+        nmap_options=nmap_options,
     )
     batch_result: Dict[str, str] = {ip: "" for ip in batch_ips}
     batch_result.update(safe_parse_nmap_xml(Path(b_xml)))
@@ -353,6 +413,191 @@ def safe_parse_nmap_xml(xml_path: Path) -> Dict[str, str]:
         return {}
 
 
+def _safe_label(value: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in value)
+
+
+def count_open_ips(result: Dict[str, str]) -> int:
+    return sum(1 for ports in result.values() if ports)
+
+
+def scan_ip_subset(
+    ips: List[str],
+    tmp_dir: Path,
+    label: str,
+    *,
+    ipv6: bool,
+    stats_every: Optional[str],
+    nmap_options: NmapOptions,
+) -> Dict[str, str]:
+    safe = _safe_label(label)
+    list_path = tmp_dir / ("%s.txt" % safe)
+    xml_path = tmp_dir / ("%s.xml" % safe)
+    write_ip_list(list_path, ips)
+    result: Dict[str, str] = {ip: "" for ip in ips}
+    try:
+        run_nmap_single(
+            list_path,
+            xml_path,
+            ipv6=ipv6,
+            stats_every=stats_every,
+            log_command=True,
+            exit_on_fail=False,
+            nmap_options=nmap_options,
+        )
+        result.update(safe_parse_nmap_xml(xml_path))
+        return result
+    except Exception as exc:
+        print("[WARN] confirm scan failed (%s): %s" % (label, exc), file=sys.stderr)
+        return result
+    finally:
+        for p in (list_path, xml_path):
+            try:
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
+
+
+def count_new_open_ips(base: Dict[str, str], scanned: Dict[str, str]) -> int:
+    return sum(1 for ip, ports in scanned.items() if ports and not base.get(ip))
+
+
+def merge_extra_ports_into_batch(
+    batch_result: Dict[str, str], extra_result: Dict[str, str]
+) -> int:
+    changed = 0
+    for ip, ports in extra_result.items():
+        if not ports:
+            continue
+        before = batch_result.get(ip, "")
+        merged = merge_ports_str(before, ports)
+        if merged != before:
+            changed += 1
+            batch_result[ip] = merged
+    return changed
+
+
+def append_confirm_checkpoint(path: Path, info: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"type": "low_open_confirm", "scan_time": time.strftime("%Y-%m-%d %H:%M:%S")}
+    payload.update(info)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def maybe_confirm_low_open_batch(
+    batch_idx: int,
+    batch_result: Dict[str, str],
+    *,
+    ipv6: bool,
+    tmp_dir: Path,
+    stats_every: Optional[str],
+    config: Optional[LowOpenConfirmConfig],
+) -> Optional[Dict[str, object]]:
+    if not config or not config.enabled or not batch_result:
+        return None
+
+    total = len(batch_result)
+    open_ips = count_open_ips(batch_result)
+    open_rate = float(open_ips) / total if total else 0.0
+    if open_rate >= config.rate_threshold and open_ips >= config.min_open_ips:
+        return None
+
+    ips = list(batch_result.keys())
+    sample_ips = ips[: min(config.sample_size, len(ips))]
+    print(
+        "  [low-open] batch %d triggered: open_ips=%d/%d (%.3f%%), sample=%d"
+        % (batch_idx, open_ips, total, open_rate * 100.0, len(sample_ips)),
+        flush=True,
+    )
+
+    info: Dict[str, object] = {
+        "batch_idx": batch_idx,
+        "total_ips": total,
+        "original_open_ips": open_ips,
+        "original_open_rate": round(open_rate, 6),
+        "sample_size": len(sample_ips),
+        "current_rescan_new_open_ips": 0,
+        "extra_sample_new_open_ips": 0,
+        "extra_full_changed_ips": 0,
+        "action": "sample_confirm_only",
+    }
+
+    sample_current = scan_ip_subset(
+        sample_ips,
+        tmp_dir,
+        "confirm_batch_%04d_current_sample" % batch_idx,
+        ipv6=ipv6,
+        stats_every=stats_every,
+        nmap_options=config.nmap_options,
+    )
+    current_new = count_new_open_ips(batch_result, sample_current)
+    info["current_rescan_new_open_ips"] = current_new
+    current_new_rate = float(current_new) / len(sample_ips) if sample_ips else 0.0
+
+    if current_new_rate >= config.expand_rate_threshold:
+        print(
+            "  [low-open] batch %d current-port rescan found %d new open IPs; rescanning full batch"
+            % (batch_idx, current_new),
+            flush=True,
+        )
+        full_current = scan_ip_subset(
+            ips,
+            tmp_dir,
+            "confirm_batch_%04d_current_full" % batch_idx,
+            ipv6=ipv6,
+            stats_every=stats_every,
+            nmap_options=config.nmap_options,
+        )
+        batch_result.clear()
+        batch_result.update(full_current)
+        info["action"] = "rescan_current_ports"
+
+    if config.extra_ports:
+        extra_opts = NmapOptions(
+            ports=config.extra_ports,
+            min_rate=config.nmap_options.min_rate,
+            max_retries=config.nmap_options.max_retries,
+            host_timeout=config.nmap_options.host_timeout,
+        )
+        sample_extra = scan_ip_subset(
+            sample_ips,
+            tmp_dir,
+            "confirm_batch_%04d_extra_sample" % batch_idx,
+            ipv6=ipv6,
+            stats_every=stats_every,
+            nmap_options=extra_opts,
+        )
+        extra_new = count_new_open_ips(batch_result, sample_extra)
+        info["extra_sample_new_open_ips"] = extra_new
+        extra_new_rate = float(extra_new) / len(sample_ips) if sample_ips else 0.0
+
+        if extra_new_rate >= config.expand_rate_threshold:
+            print(
+                "  [low-open] batch %d extra ports found %d new open IPs; scanning full batch extra ports"
+                % (batch_idx, extra_new),
+                flush=True,
+            )
+            full_extra = scan_ip_subset(
+                ips,
+                tmp_dir,
+                "confirm_batch_%04d_extra_full" % batch_idx,
+                ipv6=ipv6,
+                stats_every=stats_every,
+                nmap_options=extra_opts,
+            )
+            changed = merge_extra_ports_into_batch(batch_result, full_extra)
+            info["extra_full_changed_ips"] = changed
+            info["action"] = (
+                "rescan_current_and_expand_extra"
+                if info["action"] == "rescan_current_ports"
+                else "expand_extra_ports"
+            )
+    print("  [low-open] batch %d action=%s" % (batch_idx, info["action"]), flush=True)
+    return info
+
+
 def run_nmap_scan(
     ips: List[str],
     ip_list_path: Path,
@@ -363,9 +608,10 @@ def run_nmap_scan(
     step_label: str = "",
     batch_size: int = 100,
     keep_batch_files: bool = False,
-    on_batch_done: Optional[Callable[[Dict[str, str]], None]] = None,
+    on_batch_done: Optional[BatchCallback] = None,
     parallel_workers: int = 1,
     merge_xml: bool = True,
+    nmap_options: Optional[NmapOptions] = None,
 ) -> None:
     """
     Scan `ips` in batches.
@@ -378,6 +624,7 @@ def run_nmap_scan(
     prefix = ("[%s] " % step_label) if step_label else ""
     kind = "IPv6" if ipv6 else "IPv4"
     total_ips = len(ips)
+    opts = nmap_options or NmapOptions()
 
     if total_ips == 0:
         return
@@ -398,12 +645,13 @@ def run_nmap_scan(
             ipv6=ipv6,
             stats_every=stats_every,
             log_command=True,
+            nmap_options=opts,
         )
         # Build full result: all IPs → "" default, overwrite with actual XML results
         batch_result: Dict[str, str] = {ip: "" for ip in ips}
         batch_result.update(safe_parse_nmap_xml(xml_path))
         if on_batch_done:
-            on_batch_done(batch_result)
+            on_batch_done(1, batch_result)
         print_ip_progress(prefix, total_ips, total_ips, 1, 1, t0)
         open_count = sum(1 for v in batch_result.values() if v)
         print(
@@ -423,7 +671,7 @@ def run_nmap_scan(
 
     batch_xml_paths: List[Path] = []
     batch_list_paths: List[Path] = []
-    jobs: List[Tuple[int, List[str], str, str, bool, Optional[str]]] = []
+    jobs: List[Tuple[int, List[str], str, str, bool, Optional[str], NmapOptions]] = []
 
     for batch_idx, batch_ips in enumerate(batches, start=1):
         b_list = batch_path(ip_list_path, batch_idx)
@@ -440,6 +688,7 @@ def run_nmap_scan(
                 str(b_xml),
                 ipv6,
                 stats_every,
+                opts,
             )
         )
 
@@ -447,7 +696,7 @@ def run_nmap_scan(
 
     if parallel_workers <= 1:
         for job in jobs:
-            batch_idx, batch_ips, b_list_s, b_xml_s, _, _ = job
+            batch_idx, batch_ips, b_list_s, b_xml_s, _, _, _ = job
             b_xml = Path(b_xml_s)
             print(
                 "%s  batch %d/%d: scanning %d IPs..."
@@ -460,6 +709,7 @@ def run_nmap_scan(
                 ipv6=ipv6,
                 stats_every=stats_every,
                 log_command=False,
+                nmap_options=opts,
             )
             done_ips += len(batch_ips)
             print_ip_progress(prefix, done_ips, total_ips, batch_idx, batch_total, t0)
@@ -467,7 +717,7 @@ def run_nmap_scan(
             batch_result = {ip: "" for ip in batch_ips}
             batch_result.update(safe_parse_nmap_xml(b_xml))
             if on_batch_done:
-                on_batch_done(batch_result)
+                on_batch_done(batch_idx, batch_result)
     else:
         print(
             "%s  parallel workers: %d (flush/checkpoint on main thread)"
@@ -497,7 +747,7 @@ def run_nmap_scan(
                     prefix, done_ips, total_ips, batch_idx, batch_total, t0
                 )
                 if on_batch_done:
-                    on_batch_done(batch_result)
+                    on_batch_done(batch_idx, batch_result)
 
     _finish_batch_scan(
         prefix,
@@ -934,12 +1184,75 @@ def main() -> int:
         default=4,
         help="Parallel -sV verification workers for anomalous IPs (default 4)",
     )
+    parser.add_argument(
+        "--low-open-confirm",
+        action="store_true",
+        help="Enable low-open batch confirmation scans (default off)",
+    )
+    parser.add_argument(
+        "--low-open-rate-threshold",
+        type=float,
+        default=0.005,
+        help="Trigger low-open confirmation below this open-IP ratio (default 0.005)",
+    )
+    parser.add_argument(
+        "--low-open-min-open-ips",
+        type=int,
+        default=5,
+        help="Trigger low-open confirmation when batch open IPs are below this count (default 5)",
+    )
+    parser.add_argument(
+        "--confirm-sample-size",
+        type=int,
+        default=50,
+        help="Number of IPs sampled for low-open confirmation (default 50)",
+    )
+    parser.add_argument(
+        "--confirm-ports",
+        default=None,
+        help="Extra ports for low-open expansion; omitted means no extra-port expansion",
+    )
+    parser.add_argument(
+        "--confirm-ports-file",
+        default=None,
+        help="File containing extra ports for low-open expansion",
+    )
+    parser.add_argument(
+        "--confirm-min-rate",
+        default="1000",
+        help="nmap --min-rate for low-open confirmation scans (default 1000)",
+    )
+    parser.add_argument(
+        "--confirm-max-retries",
+        default="2",
+        help="nmap --max-retries for low-open confirmation scans (default 2)",
+    )
+    parser.add_argument(
+        "--confirm-host-timeout",
+        default="300s",
+        help="nmap --host-timeout for low-open confirmation scans (default 300s)",
+    )
+    parser.add_argument(
+        "--confirm-expand-rate-threshold",
+        type=float,
+        default=0.01,
+        help="Expand from sample to full batch when new-open sample ratio reaches this value (default 0.01)",
+    )
     args = parser.parse_args()
     if args.parallel_workers < 1:
         print("--parallel-workers must be >= 1", file=sys.stderr)
         return 1
     if args.verify_workers < 1:
         print("--verify-workers must be >= 1", file=sys.stderr)
+        return 1
+    if args.confirm_sample_size < 1:
+        print("--confirm-sample-size must be >= 1", file=sys.stderr)
+        return 1
+    if args.low_open_min_open_ips < 0:
+        print("--low-open-min-open-ips must be >= 0", file=sys.stderr)
+        return 1
+    if args.low_open_rate_threshold < 0 or args.confirm_expand_rate_threshold < 0:
+        print("low-open thresholds must be >= 0", file=sys.stderr)
         return 1
     install_signal_handlers()
     stats_every: Optional[str] = args.stats_every
@@ -968,6 +1281,24 @@ def main() -> int:
     cache_path = base_dir / args.cache
     checkpoint_path = base_dir / args.checkpoint
 
+    confirm_extra_ports = load_ports_spec(
+        args.confirm_ports, args.confirm_ports_file, base_dir
+    )
+    low_open_config = LowOpenConfirmConfig(
+        enabled=args.low_open_confirm,
+        rate_threshold=args.low_open_rate_threshold,
+        min_open_ips=args.low_open_min_open_ips,
+        sample_size=args.confirm_sample_size,
+        expand_rate_threshold=args.confirm_expand_rate_threshold,
+        extra_ports=confirm_extra_ports,
+        nmap_options=NmapOptions(
+            ports=SCAN_PORTS,
+            min_rate=args.confirm_min_rate,
+            max_retries=args.confirm_max_retries,
+            host_timeout=args.confirm_host_timeout,
+        ),
+    )
+
     merge_xml = args.merge_xml or (args.parallel_workers <= 1)
 
     print("Input:  %s" % input_path)
@@ -976,6 +1307,16 @@ def main() -> int:
         print("Parallel workers: %d" % args.parallel_workers)
         if not merge_xml:
             print("XML merge: disabled (use --merge-xml to enable)")
+    if args.low_open_confirm:
+        print(
+            "Low-open confirm: enabled | threshold %.3f%% or <%d open IPs | sample %d | extra ports: %s"
+            % (
+                args.low_open_rate_threshold * 100.0,
+                args.low_open_min_open_ips,
+                args.confirm_sample_size,
+                "yes" if confirm_extra_ports else "no",
+            )
+        )
 
     if not input_path.is_file():
         print("Input not found: %s" % input_path, file=sys.stderr)
@@ -1021,29 +1362,42 @@ def main() -> int:
     # Called after every nmap batch with {ip: open_ports_str} for all IPs in
     # that batch (empty string = scanned, no open ports found).
     # Updates cache and appends a compact checkpoint; final CSV is written once.
-    def flush_batch(batch_result: Dict[str, str]) -> None:
-        verify_anomalous_ports(
-            batch_result,
-            anomaly_threshold,
-            tmp_dir,
-            stats_every,
-            args.verify_workers,
-        )
-        cache.update(batch_result)
-        save_cache(cache_path, cache)
-        append_checkpoint(checkpoint_path, batch_result)
-        with_ports = sum(1 for v in cache.values() if v)
-        print(
-            "  [checkpoint] +%d IPs flushed | cache: %d total | "
-            "%d with ports | checkpoint -> %s"
-            % (
-                len(batch_result),
-                len(cache),
-                with_ports,
-                checkpoint_path,
-            ),
-            flush=True,
-        )
+    def make_flush_batch(is_v6: bool) -> BatchCallback:
+        def flush_batch(batch_idx: int, batch_result: Dict[str, str]) -> None:
+            confirm_info = maybe_confirm_low_open_batch(
+                batch_idx,
+                batch_result,
+                ipv6=is_v6,
+                tmp_dir=tmp_dir,
+                stats_every=stats_every,
+                config=low_open_config,
+            )
+            verify_anomalous_ports(
+                batch_result,
+                anomaly_threshold,
+                tmp_dir,
+                stats_every,
+                args.verify_workers,
+            )
+            cache.update(batch_result)
+            save_cache(cache_path, cache)
+            append_checkpoint(checkpoint_path, batch_result)
+            if confirm_info:
+                append_confirm_checkpoint(checkpoint_path, confirm_info)
+            with_ports = sum(1 for v in cache.values() if v)
+            print(
+                "  [checkpoint] +%d IPs flushed | cache: %d total | "
+                "%d with ports | checkpoint -> %s"
+                % (
+                    len(batch_result),
+                    len(cache),
+                    with_ports,
+                    checkpoint_path,
+                ),
+                flush=True,
+            )
+
+        return flush_batch
     # -------------------------------------------------------------------------
 
     if not args.skip_scan:
@@ -1075,7 +1429,7 @@ def main() -> int:
                     step_label="%d/%d %s" % (idx, total_steps, kind),
                     batch_size=args.batch_size,
                     keep_batch_files=args.keep_batch_files,
-                    on_batch_done=flush_batch,
+                    on_batch_done=make_flush_batch(is_v6),
                     parallel_workers=args.parallel_workers,
                     merge_xml=merge_xml,
                 )

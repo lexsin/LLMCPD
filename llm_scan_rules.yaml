@@ -115,14 +115,12 @@ phase1:
         values:
           - /v1/chat/completions
           - /v1/embeddings
-          - /api/generate
 
   # Suspect detection: "/" response body contains frontend framework signals
   # (→ is_llm = "疑似" when no API path confirmed LLM).
   suspect:
     keywords:
       - gradio
-      - streamlit
       - open-webui
       - __gradio_mode__
       - _stcore
@@ -133,16 +131,75 @@ phase1:
         values:
           - "<title>dify</title>"
           - "/_next/static/"
-      - type: body_all_substrings_ci
-        values: [chat, model]
-        exclude_if_contains:
-          - "copyright"
-          - "terms of service"
-          - "privacy policy"
-          - "ng-model"    # AngularJS 数据绑定指令
-          - "ng-app"      # AngularJS 应用声明
-          - "v-model"     # Vue.js 数据绑定指令
-          - "x-model"     # Alpine.js 数据绑定指令
+
+  # Optional SPA/JS-bundle suspect detection.  This does not execute JS; it
+  # fetches a small number of same-origin bundle files referenced by "/" and
+  # searches for strong LLM/OpenAI-compatible API signals.
+  js_bundle_suspect:
+    enabled: true
+    max_scripts: 3
+    max_bytes: 262144
+    include_src_patterns:
+      - ".js"
+      - "/_next/static/"
+      - "/static/js/"
+      - "/assets/"
+    api_path_keywords:
+      - "/v1/chat/completions"
+      - "/v1/models"
+      - "/v1/embeddings"
+      - "/api/chat"
+      - "/api/conversation"
+    semantic_keywords:
+      - openai
+      - api_key
+      - api-key
+      - llm
+      - chatgpt
+      - jy-chat
+      - modelspage
+      - aiapp
+      - aimodel
+      - airag
+      - chat-ai-window
+      - qwen
+      - deepseek
+      - ollama
+      - vllm
+    chat_keywords:
+      - chatcomposer
+      - chatplaygroundpage
+      - aichat
+      - chat-ai-window
+      - 'role:`assistant`'
+      - 'role:"assistant"'
+      - promptmarket
+    exclude_keywords:
+      - grafana
+      - portainer
+      - minio
+      - prometheus
+      - ruoyi
+      - swagger-ui
+      - seeyon
+      - wechataccountauthmanager
+      - getorgmodel
+      - wechat
+      - ngmodel
+      - ng-model
+      - v-model
+      - x-model
+      - ismodellistener
+      - ace/ext/modelist
+      - gmssh
+      - fortigate
+      - atrust
+      - dataease
+      - devops workplace
+      - competitionapply-web
+      - haosmart
+      - 悟空crm
+      - 审批系统
 
   # Guards: downgrade "确认" to "疑似" when the root page already shows a
   # frontend-only UI that makes the API signal ambiguous.
@@ -164,11 +221,9 @@ phase1:
   auth_suspect:
     status_codes: [401, 403]
     body_keywords:
-      - bearer
       - api-key
       - api_key
       - openai
-      - llm
       # "authorization" removed: too generic — S3/MinIO 403 bodies always contain it
     # If any of these strings appear in the body, skip the auth check entirely.
     # Prevents S3/object-storage XML error pages from triggering false positives.
@@ -179,6 +234,28 @@ phase1:
       - "SignatureDoesNotMatch"
       - "NoSuchBucket"
       - "InvalidAccessKeyId"
+      # Generic auth / gateway pages
+      - "<title>401 Unauthorized</title>"
+      - "<title>403 Forbidden</title>"
+      - "<title>403</title>"
+      - "401 Unauthorized"
+      - "403 Forbidden"
+      - "conf not found"
+      - "Document Error: Unauthorized"
+      - "Web Filtering"
+      # Elasticsearch / generic security APIs
+      - "security_exception"
+      - "missing authentication credentials"
+      - "WWW-Authenticate"
+      # Probe-path reflections and generic login/API gateway responses
+      - "Access Denied"
+      - "Authentication required"
+      - "data-redirect-url"
+      - "/login?from="
+      - "token is empty for uri"
+      - '"error":"Forbidden"'
+      - '"path":"/openai/v1/models"'
+      - "uri {/openai/v1/models}"
 
 
 # ── Phase 2 – Deploy tool identification ─────────────────────────────────────
