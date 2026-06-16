@@ -1,0 +1,60 @@
+# llm_detect 配置示例。复制为 config.yaml 后按需修改。
+
+database:
+  host: 127.0.0.1
+  port: 3306
+  user: llmdetect
+  password: change-me
+  database: llm_detect
+  charset: utf8mb4
+  pool_size: 8
+
+orchestrator:
+  poll_interval_sec: 5            # probe_task 轮询间隔
+  max_concurrent_tasks: 1         # 同时执行的 task 数(nmap 抢资源,默认 1)
+  worker_id: worker-1             # 写入 updater 字段以便排查
+  reset_running_on_startup: true  # 启动时把残留 RUNNING 行重置回 PENDING
+
+stages:
+  stage1_scan:
+    ping_workers: 32
+    ping_timeout_sec: 4.0
+    nmap_batch_size: 100              # 每批 IP 数(0=不分批)
+    nmap_parallel_workers: 1          # >1 启 ProcessPoolExecutor 并行(原脚本的优化)
+    nmap_stats_every: 60s             # nmap --stats-every,null 关闭
+    nmap_min_rate: 5000
+    nmap_max_retries: 1
+    nmap_host_timeout: 180s
+    # 异常端口数复核:每批扫完后,把开放端口数 > 阈值的 IP 重做一次 `-sV --version-intensity 0`,
+    # 过滤掉 tcpwrapped(防火墙对所有 SYN 都回 ACK 的假阳性)。0 = 关闭。
+    nmap_anomaly_threshold: 20
+    nmap_verify_workers: 4            # -sV 复核线程池大小
+    # 低开放率确认(运营商低开放率大段场景。默认关闭,扫报备 IP 段一般不需要)
+    # 触发条件:开放 IP 占比 < low_open_rate_threshold 或开放 IP 数 < low_open_min_open_ips
+    # 流程:抽样复扫当前端口 → 命中再扫整批 → 扫扩展端口 → 命中再扫整批扩展端口
+    low_open_enabled: false
+    low_open_rate_threshold: 0.005    # 0.5%
+    low_open_min_open_ips: 5
+    low_open_sample_size: 50
+    low_open_expand_rate_threshold: 0.01
+    low_open_extra_ports: ""          # 例如 "1024-2000,5000,9090"
+    low_open_min_rate: 1000
+    low_open_max_retries: 2
+    low_open_host_timeout: 300s
+    skip_ping: true                   # true = 不 ping,直接 nmap(默认,因为运营商网段常屏蔽 ICMP)
+  stage2_endpoint: {}
+  stage3_endpoint:                # 兼容键,等同 stage4_llm.batch_size
+    batch_size: 2000
+  stage4_llm:
+    batch_size: 2000
+    concurrency_override: null    # null = 用 yaml 默认
+    rules_yaml: null              # null = vendor/llm_scan_rules.yaml,缺失则用内置默认
+
+http_api:
+  enabled: false
+  host: 0.0.0.0
+  port: 8088
+
+logging:
+  level: INFO
+  file: null                      # null = 仅 stdout

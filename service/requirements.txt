@@ -1,0 +1,6 @@
+aiohttp>=3.9.0
+pyyaml>=6.0
+mysql-connector-python>=8.0.33
+# 可选:HTTP wake/health 端点
+fastapi>=0.110.0
+uvicorn>=0.27.0
