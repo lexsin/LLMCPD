@@ -19,7 +19,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 try:
@@ -40,6 +40,7 @@ EVIDENCE_SEP = "|||"
 
 OUTPUT_FIELDNAMES = [
     "ip", "port", "protocol", "is_llm",
+    "service_type", "model_domain", "gpu_likelihood", "gpu_evidence",
     "deploy_tool", "deploy_version", "model_info", "evidence", "link", "scan_time",
 ]
 
@@ -61,6 +62,10 @@ class TargetState:
     port: str
     protocol: str = ""            # http / https / ""
     is_llm: str = "否"
+    service_type: str = ""
+    model_domain: str = ""
+    gpu_likelihood: str = ""
+    gpu_evidence: str = ""
     deploy_tool: str = ""
     deploy_version: str = ""
     model_info: str = ""
@@ -90,6 +95,10 @@ class TargetState:
             "port": self.port,
             "protocol": self.protocol,
             "is_llm": self.is_llm,
+            "service_type": self.service_type,
+            "model_domain": self.model_domain,
+            "gpu_likelihood": self.gpu_likelihood,
+            "gpu_evidence": self.gpu_evidence,
             "deploy_tool": self.deploy_tool,
             "deploy_version": self.deploy_version,
             "model_info": self.model_info,
@@ -484,6 +493,150 @@ def _cached(state: TargetState, path: str) -> Optional[ProbeResult]:
     return None
 
 
+def _as_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return []
+
+
+def _json_dict(body: str) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(body)
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _root_model_class(state: TargetState) -> Tuple[str, str]:
+    root = state.probes.get("/")
+    if not root or root.status != 200:
+        return "", ""
+    data = _json_dict(root.body)
+    if not data:
+        return "", ""
+    model_class = str(data.get("model_class") or "")
+    status = str(data.get("status") or "")
+    return model_class, status
+
+
+def _first_keyword_hit(text: str, keywords: List[str]) -> str:
+    low = text.lower()
+    for kw in keywords:
+        if kw.lower() in low:
+            return kw
+    return ""
+
+
+def _probe_text(state: TargetState) -> str:
+    return "\n".join(
+        pr.body for pr in state.probes.values()
+        if pr and pr.status > 0 and pr.body
+    )
+
+
+def _gpu_hits(state: TargetState, cfg: ScanConfig) -> List[str]:
+    ai_cfg = cfg.ai_service or {}
+    keywords = (
+        _as_list(ai_cfg.get("gpu_keywords"))
+        + _as_list(ai_cfg.get("tensorrt_llm_keywords"))
+    )
+    hits: List[str] = []
+    for path, pr in state.probes.items():
+        if not pr or pr.status <= 0 or not pr.body:
+            continue
+        low = pr.body.lower()
+        for kw in keywords:
+            if kw.lower() in low:
+                item = "%s:%s" % (path, kw)
+                if item not in hits:
+                    hits.append(item)
+    return hits[:5]
+
+
+def _model_domain(text: str, cfg: ScanConfig) -> str:
+    ai_cfg = cfg.ai_service or {}
+    low = text.lower()
+    if _first_keyword_hit(low, _as_list(ai_cfg.get("ocr_keywords"))):
+        return "ocr"
+    if _first_keyword_hit(low, _as_list(ai_cfg.get("vision_keywords"))):
+        return "vision"
+    if "embedding" in low or "bge-m3" in low or "m3e" in low:
+        return "embedding"
+    if "reranker" in low:
+        return "reranker"
+    if any(x in low for x in ["qwen-vl", "vl-", "vision-language", "multimodal"]):
+        return "multimodal"
+    if any(x in low for x in ["qwen", "deepseek", "llama", "chatglm", "vllm", "ollama"]):
+        return "llm"
+    return "unknown"
+
+
+def _apply_service_classification(state: TargetState, cfg: ScanConfig) -> None:
+    model_class, model_status = _root_model_class(state)
+    body_text = _probe_text(state)
+    combined = " ".join([
+        state.deploy_tool or "",
+        state.model_info or "",
+        model_class,
+        body_text[:2000],
+    ])
+    gpu_hits = _gpu_hits(state, cfg)
+
+    if not state.protocol:
+        state.service_type = "非HTTP"
+        state.model_domain = "unknown"
+        state.gpu_likelihood = "未知"
+        state.gpu_evidence = ""
+        return
+
+    if model_class and model_status.upper() == "UP":
+        state.is_llm = "否"
+        state.service_type = "AI模型服务"
+        state.deploy_tool = state.deploy_tool or "AI模型服务"
+        state.model_info = state.model_info or model_class
+        state.model_domain = _model_domain(model_class, cfg)
+        state.gpu_likelihood = "高" if gpu_hits else (
+            "中" if state.model_domain in {"vision", "ocr"} else "低到中"
+        )
+        evidence = ["model_class=%s" % model_class, "status=%s" % model_status]
+        evidence.extend(gpu_hits)
+        state.gpu_evidence = "; ".join(evidence)
+        return
+
+    if state.is_llm == "确认":
+        state.service_type = "LLM服务"
+        state.model_domain = _model_domain(combined, cfg)
+        high_tools = {"vllm", "tgi", "sglang", "xinference", "triton", "TensorRT-LLM"}
+        mid_tools = {"ollama", "llama.cpp", "未知-OpenAI兼容", "localai", "fastchat", "litellm", "langserve"}
+        if state.deploy_tool in high_tools or gpu_hits:
+            state.gpu_likelihood = "高"
+        elif state.deploy_tool in mid_tools:
+            state.gpu_likelihood = "中高"
+        else:
+            state.gpu_likelihood = "中高"
+        evidence = list(gpu_hits)
+        if state.deploy_tool == "未知-OpenAI兼容":
+            evidence.append("OpenAI-compatible API; may be proxy")
+        state.gpu_evidence = "; ".join(evidence)
+        return
+
+    if state.is_llm == "疑似":
+        frontend_tools = {"open-webui", "one-api", "gradio", "streamlit"}
+        ai_cfg = cfg.ai_service or {}
+        frontend_hit = _first_keyword_hit(combined, _as_list(ai_cfg.get("frontend_keywords")))
+        if state.deploy_tool in frontend_tools or frontend_hit or any("JS bundle suspect" in e for e in state.evidence):
+            state.service_type = "AI前端服务"
+            state.model_domain = _model_domain(combined, cfg)
+            state.gpu_likelihood = "中" if gpu_hits else "中"
+            state.gpu_evidence = "; ".join(gpu_hits or ([frontend_hit] if frontend_hit else []))
+            return
+
+    state.service_type = "普通Web"
+    state.model_domain = "unknown"
+    state.gpu_likelihood = "未知"
+    state.gpu_evidence = "; ".join(gpu_hits)
+
+
 def _source_path(source: str) -> str:
     """Extract the URL path component from a source string like 'cached:/api/tags'."""
     if ":" in source:
@@ -858,11 +1011,14 @@ async def run_pipeline(
             print("Phase 2: deploy tool (%d targets, concurrency=%d)..." % (len(phase2_targets), p2_c))
             phase2_targets = await phase2_deploy(phase2_targets, p2_c, cfg)
 
-        # Phase 3 — confirmed only
-        confirmed_after_p2 = [s for s in phase2_targets if s.is_llm == "确认"]
-        if confirmed_after_p2:
-            print("Phase 3: model info (%d targets, concurrency=%d)..." % (len(confirmed_after_p2), p3_c))
-            confirmed_after_p2 = await phase3_model(confirmed_after_p2, p3_c, cfg)
+        # Phase 3 — confirmed LLM plus root model_class services
+        phase3_targets = [
+            s for s in phase2_targets
+            if s.is_llm == "确认" or _root_model_class(s)[0]
+        ]
+        if phase3_targets:
+            print("Phase 3: model info (%d targets, concurrency=%d)..." % (len(phase3_targets), p3_c))
+            phase3_targets = await phase3_model(phase3_targets, p3_c, cfg)
 
         # Stamp scan_time for all processed targets
         ts = _now()
@@ -874,7 +1030,7 @@ async def run_pipeline(
         state_map: Dict[str, TargetState] = {}
         for s in phase2_targets:
             state_map["%s:%s" % (s.ip, s.port)] = s
-        for s in confirmed_after_p2:
+        for s in phase3_targets:
             state_map["%s:%s" % (s.ip, s.port)] = s
 
         batch_states: List[TargetState] = []
@@ -884,6 +1040,9 @@ async def run_pipeline(
             key = "%s:%s" % (s.ip, s.port)
             batch_states.append(state_map.get(key, s))
 
+        for s in batch_states:
+            _apply_service_classification(s, cfg)
+
         rows = [s.to_row() for s in batch_states]
         write_csv_rows(output_path, rows, append=append_mode)
         append_mode = True  # subsequent batches always append
@@ -892,18 +1051,24 @@ async def run_pipeline(
 
         llm_count = sum(1 for r in rows if r["is_llm"] == "确认")
         suspect_count = sum(1 for r in rows if r["is_llm"] == "疑似")
-        print("  Batch written: %d rows (%d confirmed LLM, %d suspect)" % (
-            len(rows), llm_count, suspect_count
+        ai_model_count = sum(1 for r in rows if r["service_type"] == "AI模型服务")
+        ai_frontend_count = sum(1 for r in rows if r["service_type"] == "AI前端服务")
+        print("  Batch written: %d rows (%d confirmed LLM, %d suspect, %d AI model, %d AI frontend)" % (
+            len(rows), llm_count, suspect_count, ai_model_count, ai_frontend_count
         ))
 
     # Summary
     total_written = len(all_result_rows)
     total_confirmed = sum(1 for r in all_result_rows if r["is_llm"] == "确认")
     total_suspect = sum(1 for r in all_result_rows if r["is_llm"] == "疑似")
+    total_ai_model = sum(1 for r in all_result_rows if r["service_type"] == "AI模型服务")
+    total_ai_frontend = sum(1 for r in all_result_rows if r["service_type"] == "AI前端服务")
     print("\n=== Done ===")
     print("Total rows written: %d" % total_written)
     print("LLM confirmed: %d" % total_confirmed)
     print("LLM suspect:   %d" % total_suspect)
+    print("AI model services:    %d" % total_ai_model)
+    print("AI frontend services: %d" % total_ai_frontend)
     print("Output: %s" % output_path)
 
 

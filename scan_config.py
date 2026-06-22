@@ -302,6 +302,7 @@ class ScanConfig:
     phase1: Phase1Config
     phase2: Phase2Config
     phase3: Phase3Config
+    ai_service: Dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +386,7 @@ def _parse_config_dict(raw: dict) -> ScanConfig:
         phase1=_parse_phase1(raw),
         phase2=_parse_phase2(raw),
         phase3=_parse_phase3(raw),
+        ai_service=raw.get("ai_service", {}),
     )
 
 
@@ -501,6 +503,13 @@ def _build_hardcoded_default() -> ScanConfig:
                         "copyright", "terms of service", "privacy policy",
                     ],
                 },
+                {
+                    "type": "json_all",
+                    "rules": [
+                        {"field": "model_class", "op": "exists"},
+                        {"field": "status", "op": "eq", "value": "UP"},
+                    ],
+                },
             ],
             guards=[
                 {
@@ -542,6 +551,14 @@ def _build_hardcoded_default() -> ScanConfig:
                 supplements=[], version_from=None, requires_cached_ok=None,
             ),
             Phase2ToolConfig(
+                name="AI模型服务", scope=["suspect"],
+                match={"source": "root", "type": "json_all", "rules": [
+                    {"field": "model_class", "op": "exists"},
+                    {"field": "status", "op": "eq", "value": "UP"},
+                ]},
+                supplements=[], version_from=None, requires_cached_ok=None,
+            ),
+            Phase2ToolConfig(
                 name="ollama", scope=["confirmed"],
                 match={"source": "cached:/api/tags", "type": "json_has_key",
                        "key": "models"},
@@ -565,6 +582,17 @@ def _build_hardcoded_default() -> ScanConfig:
                 supplements=[{"source": "get:/metrics", "type": "body_substring",
                               "value": "vllm_"}],
                 version_from=None, requires_cached_ok=None,
+            ),
+            Phase2ToolConfig(
+                name="TensorRT-LLM", scope=["confirmed"],
+                match={"source": "cached_or_get:/metrics",
+                       "type": "body_substring_any_ci",
+                       "values": [
+                           "tensorrt_llm", "TensorRT-LLM",
+                           "nvidia_trt_llm", "triton_tensorrt_llm",
+                       ]},
+                supplements=[], version_from=None,
+                requires_cached_ok="/v1/models",
             ),
             Phase2ToolConfig(
                 name="llama.cpp", scope=["confirmed"],
@@ -652,6 +680,8 @@ def _build_hardcoded_default() -> ScanConfig:
         ]),
         phase3=Phase3Config(
             cache_sources=[
+                {"path": "/",
+                 "extract": {"type": "json_field", "field": "model_class"}},
                 {"path": "/v1/models",
                  "extract": {"type": "json_list_field",
                              "list_key": "data", "item_field": "id"}},
@@ -712,4 +742,23 @@ def _build_hardcoded_default() -> ScanConfig:
             ],
             fallback_literal="未知",
         ),
+        ai_service={
+            "gpu_keywords": [
+                "cuda", "gpu", "nvidia", "tensorrt", "onnxruntime-gpu",
+                "torch.cuda", "device: cuda", "dcgm",
+            ],
+            "tensorrt_llm_keywords": [
+                "tensorrt_llm", "TensorRT-LLM", "nvidia_trt_llm",
+                "triton_tensorrt_llm",
+            ],
+            "vision_keywords": [
+                "yolo", "grounding", "detection", "segmentation",
+                "visual", "vision",
+            ],
+            "ocr_keywords": ["ocr", "paddleocr"],
+            "frontend_keywords": [
+                "open-webui", "dify", "chatcomposer", "chatplaygroundpage",
+                "aichat", "chat-ai-window", "jy-chat",
+            ],
+        },
     )

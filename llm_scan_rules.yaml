@@ -124,6 +124,8 @@ phase1:
       - open-webui
       - __gradio_mode__
       - _stcore
+      - jy-chat
+      - chat-ai-window
     # Additional compound predicate: body must contain ALL of these.
     # exclude_if_contains prevents generic marketing pages from matching.
     extra_predicates:
@@ -133,8 +135,10 @@ phase1:
           - "/_next/static/"
       # Generic AI/model serving endpoints, e.g.
       # {"model_class":"YOLOv8Model","status":"UP"}
-      - type: json_has_key
-        key: model_class
+      - type: json_all
+        rules:
+          - { field: model_class, op: exists }
+          - { field: status, op: eq, value: UP }
 
   # Optional SPA/JS-bundle suspect detection.  This does not execute JS; it
   # fetches a small number of same-origin bundle files referenced by "/" and
@@ -162,15 +166,23 @@ phase1:
       - chatgpt
       - jy-chat
       - modelspage
+      - chatcomposer
+      - chatplaygroundpage
+      - aichat
       - aiapp
       - aimodel
       - airag
       - chat-ai-window
+      - 'role:`assistant`'
+      - 'role:"assistant"'
+      - promptmarket
       - qwen
       - deepseek
       - ollama
       - vllm
     chat_keywords:
+      - jy-chat
+      - modelspage
       - chatcomposer
       - chatplaygroundpage
       - aichat
@@ -291,12 +303,14 @@ phase2:
         type: body_substring_any_ci
         values: ["One API", "New API"]
 
-    - name: "AI算力服务"
+    - name: "AI模型服务"
       scope: [suspect]
       match:
         source: root
-        type: json_has_key
-        key: model_class
+        type: json_all
+        rules:
+          - { field: model_class, op: exists }
+          - { field: status, op: eq, value: UP }
 
     # ── API-based checks (confirmed only) ────────────────────────────────────
     - name: ollama
@@ -335,6 +349,14 @@ phase2:
         - source: "get:/metrics"
           type: body_substring
           value: "vllm_"
+
+    - name: TensorRT-LLM
+      scope: [confirmed]
+      requires_cached_ok: /v1/models
+      match:
+        source: "cached_or_get:/metrics"
+        type: body_substring_any_ci
+        values: [tensorrt_llm, "TensorRT-LLM", nvidia_trt_llm, triton_tensorrt_llm]
 
     # The following tools require /v1/models to have been confirmed 200 in
     # Phase 1 (requires_cached_ok).  They add evidence for that path
@@ -526,3 +548,41 @@ phase3:
 
   # Value written to model_info when nothing is found
   fallback_literal: "未知"
+
+
+# ── AI/GPU compute classification hints ─────────────────────────────────────
+# These do not confirm GPU usage by themselves. They provide evidence and
+# likelihood labels for the extra CSV service_type/model_domain/gpu_* fields.
+ai_service:
+  gpu_keywords:
+    - cuda
+    - gpu
+    - nvidia
+    - tensorrt
+    - onnxruntime-gpu
+    - torch.cuda
+    - "device: cuda"
+    - dcgm
+  tensorrt_llm_keywords:
+    - tensorrt_llm
+    - TensorRT-LLM
+    - nvidia_trt_llm
+    - triton_tensorrt_llm
+  vision_keywords:
+    - yolo
+    - grounding
+    - detection
+    - segmentation
+    - visual
+    - vision
+  ocr_keywords:
+    - ocr
+    - paddleocr
+  frontend_keywords:
+    - open-webui
+    - dify
+    - chatcomposer
+    - chatplaygroundpage
+    - aichat
+    - chat-ai-window
+    - jy-chat
