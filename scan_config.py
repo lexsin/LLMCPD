@@ -240,6 +240,14 @@ class PhaseRuntime:
 
 
 @dataclass
+class GpuProbeRuntime:
+    concurrency: int
+    timeout: int
+    retries: int = 2
+    retry_delays: List[float] = field(default_factory=lambda: [0.5, 1.0])
+
+
+@dataclass
 class Phase2Runtime:
     concurrency: int
     timeout: int
@@ -251,6 +259,7 @@ class Phase2Runtime:
 class RuntimeConfig:
     phase0: PhaseRuntime
     phase1: PhaseRuntime
+    gpu_probe: GpuProbeRuntime
     phase2: Phase2Runtime
     phase3: PhaseRuntime
 
@@ -318,10 +327,19 @@ def _parse_runtime(d: dict) -> RuntimeConfig:
         )
 
     r = d.get("runtime", {})
+    gpd = r.get("gpu_probe", {})
     p2d = r.get("phase2", {})
     return RuntimeConfig(
         phase0=_pr(r.get("phase0", {}), concurrency=500, timeout=3, retries=1),
         phase1=_pr(r.get("phase1", {}), concurrency=300, timeout=5),
+        gpu_probe=GpuProbeRuntime(
+            concurrency=int(gpd.get("concurrency", 20)),
+            timeout=int(gpd.get("timeout", 10)),
+            retries=int(gpd.get("retries", 2)),
+            retry_delays=[
+                float(v) for v in gpd.get("retry_delays", [0.5, 1.0])
+            ],
+        ),
         phase2=Phase2Runtime(
             concurrency=p2d.get("concurrency", 200),
             timeout=p2d.get("timeout", 5),
@@ -422,6 +440,10 @@ def _build_hardcoded_default() -> ScanConfig:
         runtime=RuntimeConfig(
             phase0=PhaseRuntime(concurrency=500, timeout=3, retries=1),
             phase1=PhaseRuntime(concurrency=300, timeout=5),
+            gpu_probe=GpuProbeRuntime(
+                concurrency=20, timeout=10, retries=2,
+                retry_delays=[0.5, 1.0],
+            ),
             phase2=Phase2Runtime(concurrency=200, timeout=5, max_extra_gets=3),
             phase3=PhaseRuntime(concurrency=100, timeout=10, retries=1),
         ),
@@ -494,6 +516,9 @@ def _build_hardcoded_default() -> ScanConfig:
             suspect_keywords=[
                 "gradio", "streamlit", "open-webui",
                 "__gradio_mode__", "_stcore",
+                "LibreChat", "New API", "new-api",
+                "OpenAI 接口聚合", "模型聚合与分发网关",
+                "大模型知识库", "大语言模型知识库", "智能问答知识库",
             ],
             suspect_predicates=[
                 {
@@ -547,7 +572,24 @@ def _build_hardcoded_default() -> ScanConfig:
             Phase2ToolConfig(
                 name="one-api", scope=["confirmed", "suspect"],
                 match={"source": "root", "type": "body_substring_any_ci",
-                       "values": ["One API", "New API"]},
+                       "values": [
+                           "One API", "New API", "new-api",
+                           "OpenAI 接口聚合", "模型聚合与分发网关",
+                       ]},
+                supplements=[], version_from=None, requires_cached_ok=None,
+            ),
+            Phase2ToolConfig(
+                name="librechat", scope=["suspect"],
+                match={"source": "root", "type": "body_substring_any_ci",
+                       "values": ["LibreChat"]},
+                supplements=[], version_from=None, requires_cached_ok=None,
+            ),
+            Phase2ToolConfig(
+                name="llm-knowledge-base", scope=["suspect"],
+                match={"source": "root", "type": "body_substring_any_ci",
+                       "values": [
+                           "大模型知识库", "大语言模型知识库", "智能问答知识库",
+                       ]},
                 supplements=[], version_from=None, requires_cached_ok=None,
             ),
             Phase2ToolConfig(
@@ -743,9 +785,19 @@ def _build_hardcoded_default() -> ScanConfig:
             fallback_literal="未知",
         ),
         ai_service={
+            "gpu_probe_paths": ["/metrics", "/api/ps"],
             "gpu_keywords": [
                 "cuda", "gpu", "nvidia", "tensorrt", "onnxruntime-gpu",
                 "torch.cuda", "device: cuda", "dcgm",
+            ],
+            "gpu_direct_keywords": [
+                "dcgm_", "DCGM_FI_DEV_", "nvidia-smi",
+                "cuda_visible_devices", "gpu_uuid", "gpu_device_name",
+                "gpu_device_count", "nv_gpu_", "tritonserver_gpu",
+            ],
+            "gpu_inference_keywords": [
+                "nv_inference_", "nv_model_", "vllm_",
+                "tgi_", "triton_inference",
             ],
             "tensorrt_llm_keywords": [
                 "tensorrt_llm", "TensorRT-LLM", "nvidia_trt_llm",
@@ -757,8 +809,14 @@ def _build_hardcoded_default() -> ScanConfig:
             ],
             "ocr_keywords": ["ocr", "paddleocr"],
             "frontend_keywords": [
-                "open-webui", "dify", "chatcomposer", "chatplaygroundpage",
+                "open-webui", "dify", "librechat", "new-api", "New API",
+                "OpenAI 接口聚合", "模型聚合与分发网关",
+                "大模型知识库", "大语言模型知识库", "智能问答知识库",
+                "chatcomposer", "chatplaygroundpage",
                 "aichat", "chat-ai-window", "jy-chat",
+            ],
+            "gpu_business_keywords": [
+                "租GPU", "GPU租赁", "云GPU", "BitaHub", "彼塔云",
             ],
         },
     )

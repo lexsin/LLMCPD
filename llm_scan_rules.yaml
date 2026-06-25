@@ -9,6 +9,11 @@ runtime:
   phase1:
     concurrency: 30
     timeout: 5
+  gpu_probe:
+    concurrency: 20
+    timeout: 10
+    retries: 2
+    retry_delays: [0.5, 1.0]
   phase2:
     concurrency: 20
     timeout: 5
@@ -126,6 +131,14 @@ phase1:
       - _stcore
       - jy-chat
       - chat-ai-window
+      - LibreChat
+      - New API
+      - new-api
+      - OpenAI 接口聚合
+      - 模型聚合与分发网关
+      - 大模型知识库
+      - 大语言模型知识库
+      - 智能问答知识库
     # Additional compound predicate: body must contain ALL of these.
     # exclude_if_contains prevents generic marketing pages from matching.
     extra_predicates:
@@ -216,6 +229,22 @@ phase1:
       - haosmart
       - 悟空crm
       - 审批系统
+    nextjs_deep_scan:
+      enabled: true
+      trigger_src_patterns:
+        - "/_next/static/"
+      max_scripts: 50
+      max_bytes: 524288
+      keywords:
+        - dify
+        - /console/api
+        - /workspaces/current
+        - chat-messages
+        - completion-messages
+        - model_provider
+        - provider_models
+        - SELF_HOSTED
+        - X-Dify-Version
 
   # Guards: downgrade "确认" to "疑似" when the root page already shows a
   # frontend-only UI that makes the API signal ambiguous.
@@ -301,7 +330,30 @@ phase2:
       match:
         source: root
         type: body_substring_any_ci
-        values: ["One API", "New API"]
+        values:
+          - One API
+          - New API
+          - new-api
+          - OpenAI 接口聚合
+          - 模型聚合与分发网关
+
+    - name: librechat
+      scope: [suspect]
+      match:
+        source: root
+        type: body_substring_any_ci
+        values:
+          - LibreChat
+
+    - name: llm-knowledge-base
+      scope: [suspect]
+      match:
+        source: root
+        type: body_substring_any_ci
+        values:
+          - 大模型知识库
+          - 大语言模型知识库
+          - 智能问答知识库
 
     - name: "AI模型服务"
       scope: [suspect]
@@ -554,6 +606,9 @@ phase3:
 # These do not confirm GPU usage by themselves. They provide evidence and
 # likelihood labels for the extra CSV service_type/model_domain/gpu_* fields.
 ai_service:
+  gpu_probe_paths:
+    - /metrics
+    - /api/ps
   gpu_keywords:
     - cuda
     - gpu
@@ -563,6 +618,23 @@ ai_service:
     - torch.cuda
     - "device: cuda"
     - dcgm
+  # Strong evidence exposed by same-host device/status/metrics responses.
+  gpu_direct_keywords:
+    - dcgm_
+    - DCGM_FI_DEV_
+    - nvidia-smi
+    - cuda_visible_devices
+    - gpu_uuid
+    - gpu_device_name
+    - gpu_device_count
+    - nv_gpu_
+    - tritonserver_gpu
+  gpu_inference_keywords:
+    - nv_inference_
+    - nv_model_
+    - vllm_
+    - tgi_
+    - triton_inference
   tensorrt_llm_keywords:
     - tensorrt_llm
     - TensorRT-LLM
@@ -581,8 +653,22 @@ ai_service:
   frontend_keywords:
     - open-webui
     - dify
+    - librechat
+    - new-api
+    - New API
+    - OpenAI 接口聚合
+    - 模型聚合与分发网关
+    - 大模型知识库
+    - 大语言模型知识库
+    - 智能问答知识库
     - chatcomposer
     - chatplaygroundpage
     - aichat
     - chat-ai-window
     - jy-chat
+  gpu_business_keywords:
+    - 租GPU
+    - GPU租赁
+    - 云GPU
+    - BitaHub
+    - 彼塔云

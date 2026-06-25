@@ -929,7 +929,9 @@ def _verify_ports_sv(
     ports_str: str,
     tmp_dir: Path,
     stats_every: Optional[str],
-    proc_timeout: int = 120,
+    host_timeout: str,
+    max_retries: str,
+    proc_timeout: int,
 ) -> str:
     """Re-scan a single IP with -sV --version-intensity 0 on its already-open ports.
 
@@ -951,7 +953,9 @@ def _verify_ports_sv(
         "-n",
         "-T4",
         "--host-timeout",
-        "60s",
+        host_timeout,
+        "--max-retries",
+        max_retries,
         "--open",
         "-p",
         ports_csv,
@@ -1018,6 +1022,9 @@ def verify_anomalous_ports(
     tmp_dir: Path,
     stats_every: Optional[str],
     verify_workers: int,
+    verify_host_timeout: str,
+    verify_max_retries: str,
+    verify_proc_timeout: int,
 ) -> None:
     if anomaly_threshold <= 0:
         return
@@ -1036,7 +1043,16 @@ def verify_anomalous_ports(
     )
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_verify_ports_sv, ip, ports_str, tmp_dir, stats_every): (
+            pool.submit(
+                _verify_ports_sv,
+                ip,
+                ports_str,
+                tmp_dir,
+                stats_every,
+                verify_host_timeout,
+                verify_max_retries,
+                verify_proc_timeout,
+            ): (
                 ip,
                 ports_str,
             )
@@ -1175,14 +1191,30 @@ def main() -> int:
     parser.add_argument(
         "--anomaly-threshold",
         type=int,
-        default=20,
-        help="Re-verify with -sV --version-intensity 0 if open port count exceeds this (default 20; 0 = disable)",
+        default=80,
+        help="Re-verify with -sV --version-intensity 0 if open port count exceeds this (default 80; 0 = disable)",
     )
     parser.add_argument(
         "--verify-workers",
         type=int,
-        default=4,
-        help="Parallel -sV verification workers for anomalous IPs (default 4)",
+        default=8,
+        help="Parallel -sV verification workers for anomalous IPs (default 8)",
+    )
+    parser.add_argument(
+        "--verify-host-timeout",
+        default="15s",
+        help="nmap --host-timeout for anomalous-IP -sV verification (default 15s)",
+    )
+    parser.add_argument(
+        "--verify-max-retries",
+        default="0",
+        help="nmap --max-retries for anomalous-IP -sV verification (default 0)",
+    )
+    parser.add_argument(
+        "--verify-proc-timeout",
+        type=int,
+        default=25,
+        help="Python wall-clock timeout in seconds for each -sV verification (default 25)",
     )
     parser.add_argument(
         "--low-open-confirm",
@@ -1244,6 +1276,9 @@ def main() -> int:
         return 1
     if args.verify_workers < 1:
         print("--verify-workers must be >= 1", file=sys.stderr)
+        return 1
+    if args.verify_proc_timeout < 1:
+        print("--verify-proc-timeout must be >= 1", file=sys.stderr)
         return 1
     if args.confirm_sample_size < 1:
         print("--confirm-sample-size must be >= 1", file=sys.stderr)
@@ -1378,6 +1413,9 @@ def main() -> int:
                 tmp_dir,
                 stats_every,
                 args.verify_workers,
+                args.verify_host_timeout,
+                args.verify_max_retries,
+                args.verify_proc_timeout,
             )
             cache.update(batch_result)
             save_cache(cache_path, cache)
