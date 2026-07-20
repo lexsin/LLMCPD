@@ -12,8 +12,11 @@ Usage:
 import argparse
 import asyncio
 import csv
+import hashlib
+import ipaddress
 import json
 import re
+import socket
 import ssl
 import sys
 from dataclasses import dataclass, field
@@ -21,6 +24,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
+
+try:
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+except ImportError:
+    x509 = None
+    NameOID = None
 
 try:
     import aiohttp
@@ -34,6 +44,18 @@ from scan_config import ScanConfig, eval_match, extract_models, get_default_conf
 # Fixed operational constants (not fingerprint-related, not in config)
 # ---------------------------------------------------------------------------
 
+TLS_HINT_PORTS = {
+    "443", "4443", "6443", "7443", "8443", "9443",
+    "10443", "11443", "20443", "40443",
+}
+TLS_REQUIRED_MARKERS = (
+    "plain http request was sent to https port",
+    "requires tls",
+    "https required",
+    "ssl required",
+    "use https",
+    "speaking plain http to an ssl-enabled server",
+)
 BODY_LIMIT = 1024 * 256   # bytes read per response
 EVIDENCE_BODY_MAX = 1000  # chars kept per evidence snippet
 EVIDENCE_SEP = "|||"
@@ -44,6 +66,9 @@ OUTPUT_FIELDNAMES = [
     "gpu_probe_detail", "deploy_tool", "deploy_version", "model_info",
     "evidence", "link", "scan_time",
     "分析",
+    "scan_status", "scan_confidence", "protocol_probe_detail",
+    "http_probe_detail", "certificate_names", "tested_hostnames",
+    "selected_hostname",
 ]
 
 
@@ -67,6 +92,9 @@ class ProbeResult:
     status: int = 0
     body: str = ""
     error: str = ""
+    headers: Dict[str, str] = field(default_factory=dict)
+    content_type: str = ""
+    body_hash: str = ""
 
 
 @dataclass
@@ -88,6 +116,12 @@ class TargetState:
     probes: Dict[str, ProbeResult] = field(default_factory=dict)  # path -> ProbeResult
     scan_time: str = ""
     analysis: str = ""
+    scan_status: str = ""
+    scan_confidence: str = ""
+    protocol_probe_detail: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    certificate_names: List[str] = field(default_factory=list)
+    tested_hostnames: List[str] = field(default_factory=list)
+    selected_hostname: str = ""
 
     def add_evidence(self, method: str, path: str, status: int, body: str) -> None:
         snippet = body[:EVIDENCE_BODY_MAX]
@@ -124,6 +158,17 @@ class TargetState:
             "link": self.link_str(),
             "scan_time": self.scan_time,
             "分析": self.analysis,
+            "scan_status": self.scan_status,
+            "scan_confidence": self.scan_confidence,
+            "protocol_probe_detail": json.dumps(
+                self.protocol_probe_detail, ensure_ascii=False, separators=(",", ":")
+            ) if self.protocol_probe_detail else "",
+            "http_probe_detail": json.dumps(
+                _http_probe_detail(self.probes), ensure_ascii=False, separators=(",", ":")
+            ) if self.probes else "",
+            "certificate_names": EVIDENCE_SEP.join(self.certificate_names),
+            "tested_hostnames": EVIDENCE_SEP.join(self.tested_hostnames),
+            "selected_hostname": self.selected_hostname,
         }
 
 
@@ -140,7 +185,90 @@ def make_ssl_ctx() -> ssl.SSLContext:
 _SSL_CTX = make_ssl_ctx()
 
 
-async def fetch(
+def _selected_headers(headers: Any) -> Dict[str, str]:
+    keep = {"server", "content-type", "www-authenticate", "location", "allow"}
+    return {
+        str(key).lower(): str(value)[:500]
+        for key, value in headers.items()
+        if str(key).lower() in keep
+    }
+
+
+def _response_body_hash(body: str, path: str = "") -> str:
+    """Build a stable fingerprint, ignoring reflected paths and volatile IDs/times."""
+    normalized = body.lower()
+    try:
+        parsed = json.loads(body)
+        volatile_keys = {
+            "timestamp", "time", "date", "path", "request_id", "requestid",
+            "trace_id", "traceid", "correlation_id",
+        }
+
+        def scrub(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    str(key).lower(): scrub(item)
+                    for key, item in value.items()
+                    if str(key).lower() not in volatile_keys
+                }
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            return value
+
+        normalized = json.dumps(
+            scrub(parsed), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).lower()
+    except (json.JSONDecodeError, TypeError):
+        normalized = re.sub(
+            r"(?i)(timestamp|request[_-]?id|trace[_-]?id)\s*[:=]\s*[\"']?[a-z0-9_.:-]+",
+            r"\1=<volatile>",
+            normalized,
+        )
+
+    reflected_values = () if path == "/" else (path, quote(path, safe=""))
+    for reflected in reflected_values:
+        if reflected:
+            normalized = normalized.replace(reflected.lower(), "")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _make_probe_result(
+    status: int, raw: bytes, error: str, headers: Optional[Dict[str, str]] = None,
+    path: str = "",
+) -> ProbeResult:
+    body = decode_body(raw) if raw else ""
+    selected = _selected_headers(headers or {})
+    return ProbeResult(
+        status=status,
+        body=body,
+        error=error,
+        headers=selected,
+        content_type=selected.get("content-type", ""),
+        body_hash=_response_body_hash(body, path) if status else "",
+    )
+
+
+def _http_probe_detail(probes: Dict[str, ProbeResult]) -> Dict[str, Dict[str, Any]]:
+    detail: Dict[str, Dict[str, Any]] = {}
+    for path, probe in probes.items():
+        if probe.status <= 0 and not probe.error:
+            continue
+        item: Dict[str, Any] = {
+            "status": probe.status,
+            "content_type": probe.content_type,
+            "body_hash": probe.body_hash,
+        }
+        if probe.error:
+            item["error"] = probe.error
+        for key in ("server", "www-authenticate", "location", "allow"):
+            if probe.headers.get(key):
+                item[key] = probe.headers[key]
+        detail[path] = item
+    return detail
+
+
+async def fetch_detailed(
     session: aiohttp.ClientSession,
     method: str,
     url: str,
@@ -148,8 +276,8 @@ async def fetch(
     json_body: Optional[dict] = None,
     allow_redirects: bool = True,
     read_limit: int = BODY_LIMIT,
-) -> Tuple[int, bytes, str]:
-    """Return (status, raw_bytes, error_str). Never raises."""
+) -> Tuple[int, bytes, str, Dict[str, str]]:
+    """Return status, raw bytes, error and selected response headers."""
     try:
         kwargs: dict = {
             "timeout": aiohttp.ClientTimeout(
@@ -160,20 +288,36 @@ async def fetch(
             ),
             "ssl": _SSL_CTX,
             "allow_redirects": allow_redirects,
+            "headers": {"Accept-Encoding": "identity"},
         }
         if json_body is not None:
             kwargs["json"] = json_body
         async with session.request(method, url, **kwargs) as resp:
             raw = await resp.content.read(read_limit)
-            return resp.status, raw, ""
+            return resp.status, raw, "", _selected_headers(resp.headers)
     except asyncio.TimeoutError:
-        return 0, b"", "timeout"
+        return 0, b"", "timeout", {}
     except aiohttp.ClientConnectorError as e:
-        return 0, b"", "connect_error: %s" % str(e)[:120]
+        return 0, b"", "connect_error: %s" % str(e)[:120], {}
     except aiohttp.ClientError as e:
-        return 0, b"", "client_error: %s" % str(e)[:120]
+        return 0, b"", "client_error: %s" % str(e)[:120], {}
     except Exception as e:
-        return 0, b"", "error: %s" % str(e)[:120]
+        return 0, b"", "error: %s" % str(e)[:120], {}
+
+
+async def fetch(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    timeout: int,
+    json_body: Optional[dict] = None,
+    allow_redirects: bool = True,
+    read_limit: int = BODY_LIMIT,
+) -> Tuple[int, bytes, str]:
+    status, raw, error, _ = await fetch_detailed(
+        session, method, url, timeout, json_body, allow_redirects, read_limit
+    )
+    return status, raw, error
 
 
 async def fetch_same_host_asset(
@@ -227,8 +371,191 @@ def is_binary(raw: bytes, threshold: float = 0.30) -> bool:
     return non_text / len(sample) > threshold
 
 
+def _valid_hostname(value: str) -> Optional[str]:
+    host = value.strip().rstrip(".").lower()
+    if not host or host.startswith("*.") or len(host) > 253:
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        pass
+    if host == "localhost" or not re.fullmatch(
+        r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+        host,
+    ):
+        return None
+    return host
+
+
+def _certificate_names_sync(ip: str, port: str, timeout: int) -> List[str]:
+    if x509 is None or NameOID is None:
+        return []
+    names: List[str] = []
+    try:
+        ctx = make_ssl_ctx()
+        with socket.create_connection((ip, int(port)), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=ip) as tls_sock:
+                der = tls_sock.getpeercert(binary_form=True)
+        cert = x509.load_der_x509_certificate(der)
+        try:
+            san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            names.extend(san.value.get_values_for_type(x509.DNSName))
+        except x509.ExtensionNotFound:
+            pass
+        names.extend(
+            attribute.value
+            for attribute in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        )
+    except Exception:
+        return []
+    result: List[str] = []
+    for value in names:
+        host = _valid_hostname(str(value))
+        if host and host not in result:
+            result.append(host)
+    return result[:5]
+
+
+def _reverse_dns_sync(ip: str) -> str:
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except (OSError, socket.herror):
+        return ""
+
+
+def _needs_hostname_probe(state: TargetState) -> bool:
+    root = state.probes.get("/")
+    if root and root.status in {400, 401, 403, 404, 421, 426}:
+        return True
+    return any(
+        path != "/" and probe.status in {401, 403, 404}
+        for path, probe in state.probes.items()
+    )
+
+
+async def _candidate_hostnames(state: TargetState, timeout: int) -> List[str]:
+    candidates: List[str] = []
+    root = state.probes.get("/")
+    if root and root.headers.get("location"):
+        host = _valid_hostname(urlparse(root.headers["location"]).hostname or "")
+        if host:
+            candidates.append(host)
+
+    if state.protocol == "https":
+        try:
+            cert_names = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _certificate_names_sync, state.ip, state.port, min(timeout, 5)
+                ),
+                timeout=min(timeout, 5) + 1,
+            )
+        except asyncio.TimeoutError:
+            cert_names = []
+        state.certificate_names = cert_names
+        candidates.extend(cert_names)
+
+    try:
+        ptr = await asyncio.wait_for(
+            asyncio.to_thread(_reverse_dns_sync, state.ip), timeout=2
+        )
+    except asyncio.TimeoutError:
+        ptr = ""
+    ptr_host = _valid_hostname(ptr)
+    if ptr_host:
+        candidates.append(ptr_host)
+
+    result: List[str] = []
+    for host in candidates:
+        if host not in result:
+            result.append(host)
+    return result[:3]
+
+
+def _decode_chunked(body: bytes) -> bytes:
+    result = bytearray()
+    pos = 0
+    try:
+        while pos < len(body):
+            end = body.find(b"\r\n", pos)
+            if end < 0:
+                return body
+            size = int(body[pos:end].split(b";", 1)[0], 16)
+            if size == 0:
+                return bytes(result)
+            pos = end + 2
+            result.extend(body[pos:pos + size])
+            pos += size + 2
+    except (ValueError, IndexError):
+        return body
+    return bytes(result)
+
+
+async def fetch_host_override(
+    ip: str, port: str, protocol: str, hostname: str, path: str, timeout: int,
+) -> Tuple[int, bytes, str, Dict[str, str]]:
+    """Connect to the original IP while supplying the candidate Host and TLS SNI."""
+    writer = None
+    try:
+        ssl_ctx = _SSL_CTX if protocol == "https" else None
+        server_hostname = hostname if ssl_ctx else None
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                ip, int(port), ssl=ssl_ctx, server_hostname=server_hostname
+            ),
+            timeout=min(timeout, 5),
+        )
+        request = (
+            "GET %s HTTP/1.1\r\nHost: %s\r\n"
+            "User-Agent: llm-detect/host-probe\r\n"
+            "Accept: application/json,text/html,*/*\r\n"
+            "Accept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        ) % (path, hostname)
+        writer.write(request.encode("ascii"))
+        await writer.drain()
+        response = await asyncio.wait_for(
+            reader.read(BODY_LIMIT + 65536), timeout=timeout
+        )
+        head, sep, body = response.partition(b"\r\n\r\n")
+        if not sep:
+            return 0, b"", "invalid_http_response", {}
+        lines = head.split(b"\r\n")
+        match = re.match(rb"HTTP/\d(?:\.\d)?\s+(\d{3})", lines[0])
+        if not match:
+            return 0, b"", "invalid_status_line", {}
+        headers: Dict[str, str] = {}
+        for line in lines[1:]:
+            key, colon, value = line.partition(b":")
+            if colon:
+                headers[key.decode("latin-1").strip().lower()] = (
+                    value.decode("latin-1").strip()
+                )
+        if "chunked" in headers.get("transfer-encoding", "").lower():
+            body = _decode_chunked(body)
+        return int(match.group(1)), body[:BODY_LIMIT], "", _selected_headers(headers)
+    except asyncio.TimeoutError:
+        return 0, b"", "timeout", {}
+    except Exception as e:
+        return 0, b"", "error: %s" % str(e)[:120], {}
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
 def base_url(protocol: str, ip: str, port: str) -> str:
     return "%s://%s:%s" % (protocol, ip, port)
+
+
+def _protocol_order(port: str) -> Tuple[str, str]:
+    return ("https", "http") if port in TLS_HINT_PORTS else ("http", "https")
+
+def _tls_required_response(body: str) -> bool:
+    low = body.lower()
+    return any(marker in low for marker in TLS_REQUIRED_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -247,15 +574,20 @@ async def _phase0_single(
     rt = cfg.runtime.phase0
 
     async with sem:
-        for proto in ("http", "https"):
+        fallback_http: Optional[Tuple[int, str, Dict[str, str]]] = None
+        tls_hint_seen = False
+        for proto in _protocol_order(port):
             url = "%s://%s:%s/" % (proto, ip, port)
             attempts = rt.retries + 1
-            status, raw, err = 0, b"", ""
+            status, raw, err, headers = 0, b"", "", {}
             for _ in range(attempts):
-                status, raw, err = await fetch(session, "GET", url, rt.timeout)
+                status, raw, err, headers = await fetch_detailed(
+                    session, "GET", url, rt.timeout
+                )
                 if status != 0 or err != "timeout":
                     break
 
+            state.protocol_probe_detail[proto] = {"status": status, "error": err}
             if status == 0:
                 continue
 
@@ -278,14 +610,34 @@ async def _phase0_single(
 
             # HTTP alive
             body = decode_body(raw)
-            if proto == "http" and "plain http request was sent to https port" in body.lower():
+            if proto == "http" and _tls_required_response(body):
+                tls_hint_seen = True
+                continue
+            if proto == "http" and status in {400, 421, 426}:
+                fallback_http = (status, body, headers)
                 continue
             state.protocol = proto
             state.add_evidence("GET", "/", status, body)
-            state.probes["/"] = ProbeResult(status=status, body=body)
+            state.probes["/"] = _make_probe_result(
+                status, raw, err, headers, "/"
+            )
             return state
 
-        state.evidence.append("Phase0: no HTTP response (http/https both failed)")
+        if fallback_http is not None:
+            status, body, headers = fallback_http
+            state.protocol = "http"
+            state.add_evidence("GET", "/", status, body)
+            state.probes["/"] = ProbeResult(
+                status=status, body=body, headers=headers,
+                content_type=headers.get("content-type", ""),
+                body_hash=_response_body_hash(body, "/"),
+            )
+            return state
+
+        if tls_hint_seen:
+            state.evidence.append("Phase0: TLS required but HTTPS probe failed")
+        else:
+            state.evidence.append("Phase0: no HTTP response (http/https both failed)")
         state.scan_time = _now()
         return state
 
@@ -363,6 +715,34 @@ def _match_auth_suspect(
         if normalized and normalized in sanitized:
             return normalized
     return None
+
+
+def _is_auth_specific_response(
+    path: str, probe: ProbeResult, root: Optional[ProbeResult],
+) -> bool:
+    """Separate endpoint-specific authentication from a generic gateway denial."""
+    if probe.status not in {401, 403}:
+        return False
+    if probe.headers.get("www-authenticate"):
+        return True
+
+    probe_hash = _response_body_hash(probe.body, path)
+    root_hash = _response_body_hash(root.body, "") if root and root.status > 0 else ""
+    if root_hash and probe.status == root.status and probe_hash == root_hash:
+        return False
+
+    body = probe.body.lower()
+    strong_terms = (
+        "unauthorized", "authentication required", "authentication failed",
+        "missing api key", "invalid api key", "valid api key", "api_key",
+        "bearer token", "access token", "invalid token", "token required",
+    )
+    if any(term in body for term in strong_terms):
+        return True
+    content_type = probe.content_type.lower()
+    return probe.status == 401 and (
+        "json" in content_type or body.lstrip().startswith(("{", "["))
+    )
 
 
 def _extract_script_srcs(html: str) -> List[str]:
@@ -518,6 +898,74 @@ async def _phase1_check_js_bundle(
     return None
 
 
+async def _phase1_hostname_reprobe(
+    state: TargetState, cfg: ScanConfig,
+) -> None:
+    """Retry high-value LLM paths on the same IP using certificate/PTR Host and SNI."""
+    rt = cfg.runtime.phase1
+    candidates = await _candidate_hostnames(state, rt.timeout)
+    if not candidates:
+        return
+
+    high_value = [
+        "/v1/models", "/api/v1/models", "/openai/v1/models",
+        "/api/tags", "/api/version", "/v2/models", "/",
+    ]
+    paths = [path for path in high_value if path in cfg.phase1.probe_paths or path == "/"]
+    original_root = state.probes.get("/")
+    for hostname in candidates:
+        state.tested_hostnames.append(hostname)
+        hostname_worked = False
+        for path in paths:
+            status, raw, error, headers = await fetch_host_override(
+                state.ip, state.port, state.protocol, hostname, path, rt.timeout
+            )
+            probe = _make_probe_result(status, raw, error, headers, path)
+            state.probes["host=%s%s" % (hostname, path)] = probe
+            if status == 0:
+                continue
+            if (
+                path == "/" and status < 400
+                and original_root
+                and original_root.status in {400, 401, 403, 404, 421, 426}
+            ):
+                hostname_worked = True
+            if path != "/":
+                matched_rule = _phase1_check_confirmed(path, status, probe.body, cfg)
+                if matched_rule is not None:
+                    state.probes[path] = probe
+                    state.is_llm = "确认"
+                    state.selected_hostname = hostname
+                    state.evidence.append(
+                        "Phase1 Host/SNI %s GET %s %d: %s"
+                        % (hostname, path, status, probe.body[:EVIDENCE_BODY_MAX])
+                    )
+                    state.links.append(
+                        "%s://%s:%s%s" % (
+                            state.protocol, hostname, state.port, path
+                        )
+                    )
+                    return
+            elif _phase1_check_suspect(probe.body, cfg):
+                state.probes["/"] = probe
+                state.is_llm = "疑似"
+                state.selected_hostname = hostname
+                state.evidence.append(
+                    "Phase1 Host/SNI %s root suspect %d: %s"
+                    % (hostname, status, probe.body[:EVIDENCE_BODY_MAX])
+                )
+                state.links.append(
+                    "%s://%s:%s/" % (state.protocol, hostname, state.port)
+                )
+                return
+        if hostname_worked and not state.selected_hostname:
+            state.selected_hostname = hostname
+            state.evidence.append(
+                "Phase1: Host/SNI %s changed generic root response to a successful route"
+                % hostname
+            )
+
+
 async def _phase1_single(
     sem: asyncio.Semaphore,
     session: aiohttp.ClientSession,
@@ -537,14 +985,17 @@ async def _phase1_single(
                 status, body = pr.status, pr.body
             else:
                 url = "%s://%s:%s%s" % (proto, ip, port, path)
-                status, raw, err = await fetch(session, "GET", url, rt.timeout)
+                status, raw, err, headers = await fetch_detailed(
+                    session, "GET", url, rt.timeout
+                )
+                state.probes[path] = _make_probe_result(
+                    status, raw, err, headers, path
+                )
                 if status == 0:
-                    state.probes[path] = ProbeResult(error=err)
                     if path == "/":
                         break
                     continue
-                body = decode_body(raw)
-                state.probes[path] = ProbeResult(status=status, body=body)
+                body = state.probes[path].body
 
             if path != "/":
                 # Check for auth-gated LLM signal (401/403 with relevant keywords)
@@ -581,20 +1032,27 @@ async def _phase1_single(
                     state.is_llm = "疑似"
                     state.add_evidence("GET", "/", status, body)
 
+        if state.is_llm == "否" and _needs_hostname_probe(state):
+            await _phase1_hostname_reprobe(state, cfg)
+
         if state.is_llm == "否":
             js_evidence = await _phase1_check_js_bundle(session, state, cfg)
             if js_evidence:
                 state.is_llm = "疑似"
                 state.evidence.append(js_evidence)
 
-        # Auth-gated fallback: mark 疑似 only when no stronger signal found
+        # Auth-gated fallback: require endpoint-specific auth, not a generic denial page.
         if state.is_llm == "否" and auth_signal is not None:
             auth_path, auth_status, auth_keyword = auth_signal
-            state.is_llm = "疑似"
-            state.evidence.append(
-                "Phase1: auth-gated response GET %s %d with keyword %s"
-                % (auth_path, auth_status, auth_keyword)
-            )
+            auth_probe = state.probes.get(auth_path, ProbeResult())
+            if _is_auth_specific_response(
+                auth_path, auth_probe, state.probes.get("/")
+            ):
+                state.is_llm = "疑似"
+                state.evidence.append(
+                    "Phase1: auth-gated response GET %s %d with keyword %s"
+                    % (auth_path, auth_status, auth_keyword)
+                )
 
     return state
 
@@ -697,10 +1155,10 @@ async def _extra_get(
     timeout: int,
 ) -> ProbeResult:
     url = "%s://%s:%s%s" % (proto, ip, port, path)
-    status, raw, err = await fetch(session, "GET", url, timeout)
-    if status == 0:
-        return ProbeResult(error=err)
-    return ProbeResult(status=status, body=decode_body(raw))
+    status, raw, err, headers = await fetch_detailed(
+        session, "GET", url, timeout
+    )
+    return _make_probe_result(status, raw, err, headers, path)
 
 
 def _cached(state: TargetState, path: str) -> Optional[ProbeResult]:
@@ -878,6 +1336,64 @@ def _llm_analysis_reason(state: TargetState) -> str:
             return "识别到%s模型服务，确认已部署AI模型" % state.deploy_tool
         return "模型接口返回有效模型信息，确认已部署AI模型"
     return "响应命中LLM前端或接口特征，判为疑似LLM"
+
+
+def _apply_scan_outcome(state: TargetState) -> None:
+    """Classify whether a negative result is conclusive or probe-limited."""
+    if state.is_llm == "确认":
+        state.scan_status = "llm_confirmed"
+        state.scan_confidence = "高"
+        return
+    if state.is_llm == "疑似":
+        state.scan_status = "llm_suspect"
+        state.scan_confidence = "中"
+        return
+    if state.gpu_likelihood == "高":
+        state.scan_status = "gpu_confirmed"
+        state.scan_confidence = "高"
+        return
+    if not state.protocol:
+        evidence = state.evidence_str().lower()
+        if "tls required" in evidence:
+            state.scan_status = "protocol_unknown"
+        elif "no http response" in evidence:
+            state.scan_status = "network_unreachable"
+        else:
+            state.scan_status = "protocol_unknown"
+        state.scan_confidence = "低"
+        return
+
+    model_paths = {
+        "/v1/models", "/api/v1/models", "/openai/v1/models",
+        "/api/tags", "/api/version", "/v2/models",
+    }
+    root_probe = state.probes.get("/", ProbeResult())
+    auth_restricted = any(
+        path in model_paths
+        and _is_auth_specific_response(path, probe, root_probe)
+        for path, probe in state.probes.items()
+    )
+    generic_restricted = any(
+        path in model_paths
+        and probe.status in {401, 403}
+        and not _is_auth_specific_response(path, probe, root_probe)
+        for path, probe in state.probes.items()
+    )
+    if auth_restricted:
+        state.scan_status = "auth_restricted"
+        state.scan_confidence = "中"
+    elif root_probe.status in {400, 403, 421, 426}:
+        state.scan_status = "virtual_host_or_policy_restricted"
+        state.scan_confidence = "中"
+    elif generic_restricted:
+        state.scan_status = "generic_policy_restricted"
+        state.scan_confidence = "中"
+    elif state.selected_hostname:
+        state.scan_status = "hostname_route_completed_no_llm"
+        state.scan_confidence = "高"
+    else:
+        state.scan_status = "completed_no_llm"
+        state.scan_confidence = "高"
 
 
 def _analysis_text(state: TargetState) -> str:
@@ -1426,6 +1942,20 @@ def _row_to_state(row: dict) -> TargetState:
         links=links,
         scan_time=(row.get("scan_time") or "").strip(),
         analysis=(row.get("分析") or "").strip(),
+        scan_status=(row.get("scan_status") or "").strip(),
+        scan_confidence=(row.get("scan_confidence") or "").strip(),
+        protocol_probe_detail=_parse_probe_detail(
+            row.get("protocol_probe_detail") or ""
+        ),
+        certificate_names=[
+            item for item in (row.get("certificate_names") or "").split(EVIDENCE_SEP)
+            if item
+        ],
+        tested_hostnames=[
+            item for item in (row.get("tested_hostnames") or "").split(EVIDENCE_SEP)
+            if item
+        ],
+        selected_hostname=(row.get("selected_hostname") or "").strip(),
     )
 
 
@@ -1638,6 +2168,7 @@ async def run_pipeline(
 
         for s in batch_states:
             _apply_service_classification(s, cfg)
+            _apply_scan_outcome(s)
             s.analysis = _analysis_text(s)
 
         rows = [s.to_row() for s in batch_states]

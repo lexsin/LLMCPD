@@ -218,7 +218,7 @@ python3 expand_scan_ports.py \
 
 ## 4. scan_llm.py
 
-对 **(ip, port)** 目标执行异步 HTTP 探测（Phase 0–3），识别是否为 LLM 服务、部署工具、模型信息等。
+对 **(ip, port)** 目标执行异步 HTTP 探测（Phase 0–3），识别是否为 LLM 服务、部署工具、模型信息，并对所有 HTTP/HTTPS 端口独立探测 `/metrics` 与 `/api/ps` 以发现 GPU 算力服务。
 
 依赖 `[scan_config.py](scan_config.py)` 与可选的 `llm_scan_rules.yaml`。
 
@@ -229,9 +229,32 @@ python3 expand_scan_ports.py \
 
 ### 输出列
 
-`ip`, `port`, `protocol`, `is_llm`（确认/疑似/否）, `deploy_tool`, `deploy_version`, `model_info`, `evidence`, `link`, `scan_time`
+`ip`, `port`, `protocol`, `is_llm`（确认/疑似/否）, `service_type`, `model_domain`, `gpu_likelihood`, `gpu_evidence`, `deploy_tool`, `deploy_version`, `model_info`, `evidence`, `link`, `scan_time`, `分析`
+
+### GPU 分级规则
+
+GPU 判断基于当前 `ip:port` 返回的证据，不进行同 IP 跨端口关联。
+
+| 等级 | 判断依据 |
+| --- | --- |
+| `高` | `/metrics` 返回 DCGM、`nv_gpu_*`、GPU UUID/设备信息等直接指标，或 Ollama `/api/ps` 返回 `size_vram > 0` |
+| `中` | `/metrics` 返回 `nv_inference_*`、`nv_model_*` 等推理指标，或识别到 Ollama、TGI、vLLM、Triton 等 GPU 推理框架但无直接设备指标 |
+| `低` | 仅确认/疑似 AI 或 LLM 服务，未发现当前端口的 GPU 设备或推理指标 |
+| `未知` | 普通 Web、非 HTTP，或没有足够的 AI/GPU 算力证据 |
+
+### 服务类型规则
+
+| `service_type` | 判断依据 |
+| --- | --- |
+| `GPU算力服务` | 非 LLM 端口独立返回 GPU 设备指标或推理指标 |
+| `LLM服务` | 模型 API 确认有效；即使命中 GPU 证据也保持此类型，通过 `gpu_likelihood` 表示算力等级 |
+| `AI模型服务` | 返回明确的 AI 模型类别和运行状态，但不属于已确认的 LLM API |
+| `AI前端服务` | 命中 AI 聊天/模型前端特征，但未确认本端口提供模型 API |
+| `普通Web` | HTTP/HTTPS 服务，但没有命中 AI、LLM 或 GPU 算力规则 |
+| `非HTTP` | 无有效 HTTP/HTTPS 响应或识别为其他协议 |
 
 ### 常用命令
+
 
 ```bash
 # 全量（目标多时耗时长，建议先 --limit 试跑）
@@ -249,6 +272,15 @@ python3 scan_llm.py \
 
 # 小样本测试
 python3 scan_llm.py --input data/990000762670_expanded.csv --output /tmp/llm_test.csv --limit 500
+
+# 仅重扫现有结果中的 GPU 证据，不改变 LLM 判定
+python3 scan_llm.py \
+  --gpu-rescan \
+  --input data/990000762670_llm.csv \
+  --output data/990000762670_llm_gpu.csv \
+  --checkpoint data/990000762670_gpu_checkpoint.jsonl \
+  --batch-size 100 \
+  --resume
 ```
 
 ### 参数
@@ -264,12 +296,15 @@ python3 scan_llm.py --input data/990000762670_expanded.csv --output /tmp/llm_tes
 | `--concurrency` | 配置默认                        | 覆盖各阶段并发             |
 | `--limit`       | 无                           | 只处理前 N 个目标          |
 | `--config`      | 内置/YAML                     | 自定义规则文件路径           |
+| `--gpu-rescan`  | 关                            | 仅重扫 `/metrics`、`/api/ps`，保留原 LLM 字段 |
 
 
 ### 注意
 
 - 展开后行数可能很大（例如 19k IP × 多端口 → 数十万行），请评估磁盘与时间
 - 不需要 root
+- GPU 探测使用独立配置：默认并发 20、超时 10 秒、重试 2 次，不受 `--concurrency` 覆盖
+- `gpu_probe_detail` 记录 `/metrics`、`/api/ps` 的状态码、错误、尝试次数和来源
 
 ---
 

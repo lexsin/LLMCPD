@@ -261,12 +261,15 @@ CREATE TABLE IF NOT EXISTS `probe_task` (
   `endpoint_finished` int unsigned NOT NULL DEFAULT '0' COMMENT '已完成端点数',
   `start_time` datetime DEFAULT NULL COMMENT '开始执行时间',
   `end_time` datetime DEFAULT NULL COMMENT '结束时间',
+  `worker_id` varchar(128) DEFAULT NULL COMMENT '任务租约所属实例',
+  `heartbeat_time` datetime DEFAULT NULL COMMENT '任务租约心跳时间',
   `creator` bigint unsigned DEFAULT NULL COMMENT '创建人',
   `create_date` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `updater` bigint unsigned DEFAULT NULL COMMENT '更新人',
   `update_date` datetime DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   PRIMARY KEY (`id`),
   KEY `idx_status` (`status`),
+  KEY `idx_status_heartbeat` (`status`,`heartbeat_time`),
   KEY `idx_biz_date` (`biz_date`),
   KEY `idx_create_date` (`create_date` DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='IP探测任务表';

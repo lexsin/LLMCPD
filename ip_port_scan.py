@@ -26,11 +26,16 @@ COL_END = "\u7ec8\u6b62IP"
 COL_IP = "ip"
 COL_OPEN_PORTS = "open_ports"
 COL_PING = "ping"
+COL_SCAN_STATUS = "scan_status"
+COL_UNIT_SOURCE = "\u4f7f\u7528\u5355\u4f4d\u4fe1\u606f"
 
 # No open ports -> empty string (not "none")
 # Semicolon separator avoids Excel treating "80,443" as one number with thousand separators
 PORT_SEP = ";"
-FIELDNAMES = [COL_UNIT, COL_START, COL_END, COL_IP, COL_OPEN_PORTS, COL_PING]
+FIELDNAMES = [
+    COL_UNIT, COL_START, COL_END, COL_IP, COL_OPEN_PORTS, COL_PING,
+    COL_SCAN_STATUS,
+]
 INTERRUPTED = False
 BatchCallback = Callable[[int, Dict[str, str]], None]
 
@@ -74,9 +79,10 @@ SCAN_PORTS = (
 @dataclass
 class NmapOptions:
     ports: str = SCAN_PORTS
-    min_rate: str = "5000"
-    max_retries: str = "1"
-    host_timeout: str = "180s"
+    min_rate: str = "1500"
+    max_retries: str = "2"
+    host_timeout: str = "300s"
+    skip_host_discovery: bool = True
 
 
 @dataclass
@@ -294,6 +300,8 @@ def run_nmap_single(
         "-oX",
         str(xml_path),
     ]
+    if opts.skip_host_discovery:
+        cmd.insert(1, "-Pn")
     if opts.min_rate:
         cmd[4:4] = ["--min-rate", opts.min_rate]
     if opts.max_retries:
@@ -560,6 +568,7 @@ def maybe_confirm_low_open_batch(
             min_rate=config.nmap_options.min_rate,
             max_retries=config.nmap_options.max_retries,
             host_timeout=config.nmap_options.host_timeout,
+            skip_host_discovery=config.nmap_options.skip_host_discovery,
         )
         sample_extra = scan_ip_subset(
             sample_ips,
@@ -1098,14 +1107,22 @@ def merge_results(
     output: List[dict] = []
     for row in rows:
         ip = row.get(COL_IP, "").strip()
+        open_ports = open_by_ip.get(ip, "")
+        if open_ports:
+            scan_status = "open_ports_found"
+        elif ip in open_by_ip:
+            scan_status = "scanned_no_open"
+        else:
+            scan_status = "not_scanned"
         output.append(
             {
-                COL_UNIT: row.get(COL_UNIT, ""),
+                COL_UNIT: row.get(COL_UNIT, "") or row.get(COL_UNIT_SOURCE, ""),
                 COL_START: row.get(COL_START, ""),
                 COL_END: row.get(COL_END, ""),
                 COL_IP: ip,
-                COL_OPEN_PORTS: open_by_ip.get(ip, ""),
+                COL_OPEN_PORTS: open_ports,
                 COL_PING: row.get(COL_PING, ""),
+                COL_SCAN_STATUS: scan_status,
             }
         )
     return output
@@ -1151,6 +1168,36 @@ def main() -> int:
     parser.add_argument("--checkpoint", default="port_scan_checkpoint.jsonl")
     parser.add_argument("--skip-scan", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--ports",
+        default=None,
+        help="Nmap port specification for the main scan (default: built-in LLM/GPU ports)",
+    )
+    parser.add_argument(
+        "--ports-file",
+        default=None,
+        help="File containing additional main-scan ports",
+    )
+    parser.add_argument(
+        "--min-rate",
+        default="1500",
+        help="nmap --min-rate for the main scan (default 1500)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        default="2",
+        help="nmap --max-retries for the main scan (default 2)",
+    )
+    parser.add_argument(
+        "--host-timeout",
+        default="300s",
+        help="nmap --host-timeout for the main scan (default 300s)",
+    )
+    parser.add_argument(
+        "--host-discovery",
+        action="store_true",
+        help="Enable Nmap host discovery (default: disabled with -Pn)",
+    )
     parser.add_argument(
         "--stats-every",
         default="60s",
@@ -1319,6 +1366,14 @@ def main() -> int:
     confirm_extra_ports = load_ports_spec(
         args.confirm_ports, args.confirm_ports_file, base_dir
     )
+    main_ports = load_ports_spec(args.ports, args.ports_file, base_dir) or SCAN_PORTS
+    main_nmap_options = NmapOptions(
+        ports=main_ports,
+        min_rate=args.min_rate,
+        max_retries=args.max_retries,
+        host_timeout=args.host_timeout,
+        skip_host_discovery=not args.host_discovery,
+    )
     low_open_config = LowOpenConfirmConfig(
         enabled=args.low_open_confirm,
         rate_threshold=args.low_open_rate_threshold,
@@ -1327,10 +1382,11 @@ def main() -> int:
         expand_rate_threshold=args.confirm_expand_rate_threshold,
         extra_ports=confirm_extra_ports,
         nmap_options=NmapOptions(
-            ports=SCAN_PORTS,
+            ports=main_ports,
             min_rate=args.confirm_min_rate,
             max_retries=args.confirm_max_retries,
             host_timeout=args.confirm_host_timeout,
+            skip_host_discovery=not args.host_discovery,
         ),
     )
 
@@ -1338,6 +1394,16 @@ def main() -> int:
 
     print("Input:  %s" % input_path)
     print("Output: %s" % output_path)
+    print(
+        "Main scan: ports=%d | min-rate=%s | max-retries=%s | host-timeout=%s | host discovery=%s"
+        % (
+            len(main_ports.split(",")),
+            args.min_rate,
+            args.max_retries,
+            args.host_timeout,
+            "enabled" if args.host_discovery else "disabled (-Pn)",
+        )
+    )
     if args.parallel_workers > 1:
         print("Parallel workers: %d" % args.parallel_workers)
         if not merge_xml:
@@ -1470,6 +1536,7 @@ def main() -> int:
                     on_batch_done=make_flush_batch(is_v6),
                     parallel_workers=args.parallel_workers,
                     merge_xml=merge_xml,
+                    nmap_options=main_nmap_options,
                 )
             except KeyboardInterrupt:
                 save_cache(cache_path, cache)
