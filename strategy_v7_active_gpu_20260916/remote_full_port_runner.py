@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Run the full-port worker on one SSH host and retrieve verified artifacts."""
+from __future__ import annotations
+import argparse, configparser, csv, hashlib, json, os, re, shlex, shutil
+import subprocess, sys, tempfile, time
+from pathlib import Path
+
+class RemoteExecutionError(RuntimeError): pass
+
+def safe_component(value):
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "job"
+    return clean[:72] + "-" + hashlib.sha256(value.encode()).hexdigest()[:12]
+
+def atomic_copy(source, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temp = dest.with_name(dest.name + ".remote-tmp")
+    shutil.copyfile(source, temp); os.replace(temp, dest)
+
+def validate_result_files(output, summary):
+    try: result = json.loads(summary.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc: raise RemoteExecutionError("invalid remote summary: %s" % exc)
+    required = {"selected_candidates", "completed", "failed_or_timed_out"}
+    if not isinstance(result, dict) or required.difference(result): raise RemoteExecutionError("remote summary lacks required fields")
+    try:
+        with output.open(encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames is None or not {"ip", "port"}.issubset(reader.fieldnames): raise RemoteExecutionError("remote CSV lacks ip/port")
+            list(reader)
+    except (OSError, csv.Error) as exc: raise RemoteExecutionError("invalid remote CSV: %s" % exc)
+    return result
+
+class Config:
+    def __init__(self, path):
+        parser = configparser.ConfigParser(interpolation=None)
+        if not parser.read(path, encoding="utf-8"): raise RemoteExecutionError("cannot read config: %s" % path)
+        def get(section, key, default=None):
+            if parser.has_option(section, key): return parser.get(section, key).strip()
+            if default is not None: return default
+            raise RemoteExecutionError("missing [%s] %s" % (section, key))
+        try:
+            self.host, self.user = get("ssh", "host"), get("ssh", "user")
+            self.port = int(get("ssh", "port", "22"))
+            self.identity_file = Path(get("ssh", "identity_file")).expanduser()
+            self.known_hosts_file = Path(get("ssh", "known_hosts_file")).expanduser()
+            self.remote_base_dir = get("remote", "remote_base_dir")
+            self.python_bin, self.nmap_bin = get("remote", "python_bin", "python3"), get("remote", "nmap_bin", "nmap")
+            self.connect_timeout = int(get("ssh", "connect_timeout", "10"))
+            self.transport_retries = int(get("ssh", "transport_retries", "3"))
+            self.poll_interval = int(get("ssh", "poll_interval", "5"))
+        except ValueError as exc: raise RemoteExecutionError("invalid numeric configuration: %s" % exc)
+        if not self.host or not self.user: raise RemoteExecutionError("host/user cannot be empty")
+        if not self.remote_base_dir.startswith("/") or any(x.isspace() for x in self.remote_base_dir): raise RemoteExecutionError("remote_base_dir must be an absolute path without spaces")
+        if not 1 <= self.port <= 65535 or min(self.connect_timeout, self.transport_retries, self.poll_interval) < 1: raise RemoteExecutionError("invalid SSH configuration")
+
+class Runner:
+    def __init__(self, config, worker, status_file=None, status_prefix="phase=full-port-remote"):
+        self.c, self.worker, self.status_file, self.status_prefix = config, Path(worker), status_file, status_prefix.rstrip()
+        if not self.worker.is_file(): raise RemoteExecutionError("worker script missing: %s" % self.worker)
+    @property
+    def target(self): return "%s@%s" % (self.c.user, self.c.host)
+    def ssh_base(self):
+        return ["ssh","-p",str(self.c.port),"-i",str(self.c.identity_file),"-o","BatchMode=yes","-o","IdentitiesOnly=yes","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile=%s"%self.c.known_hosts_file,"-o","ConnectTimeout=%s"%self.c.connect_timeout]
+    def scp_base(self):
+        return ["scp","-P",str(self.c.port),"-i",str(self.c.identity_file),"-o","BatchMode=yes","-o","IdentitiesOnly=yes","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile=%s"%self.c.known_hosts_file,"-o","ConnectTimeout=%s"%self.c.connect_timeout]
+    def call(self, command, description):
+        last = "unknown error"
+        for attempt in range(1, self.c.transport_retries + 1):
+            try: result = subprocess.run(command, text=True, capture_output=True, timeout=self.c.connect_timeout + 30)
+            except (OSError, subprocess.TimeoutExpired) as exc: last = str(exc)
+            else:
+                if result.returncode == 0: return result
+                last = (result.stderr or result.stdout or "exit=%s" % result.returncode).strip()
+            if attempt < self.c.transport_retries: time.sleep(min(attempt, 3))
+        raise RemoteExecutionError("%s failed after %d attempts: %s" % (description, self.c.transport_retries, last))
+    def ssh(self, script, description): return self.call(self.ssh_base()+[self.target, "sh -c "+shlex.quote(script)], description)
+    def upload(self, local, remote, description): self.call(self.scp_base()+[str(local), "%s:%s"%(self.target,remote)], description)
+    def download(self, remote, local, description): self.call(self.scp_base()+["%s:%s"%(self.target,remote),str(local)], description)
+    def status(self, state):
+        if not self.status_file: return
+        target = Path(self.status_file); target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_name(target.name+".tmp")
+        temp.write_text("%s remote_host=%s remote_state=%s\n"%(self.status_prefix,self.c.host,state),encoding="utf-8")
+        os.replace(temp,target)
+    def check_credentials(self):
+        if not self.c.identity_file.is_file(): raise RemoteExecutionError("identity file missing: %s" % self.c.identity_file)
+        if not self.c.known_hosts_file.is_file(): raise RemoteExecutionError("known_hosts file missing: %s" % self.c.known_hosts_file)
+    def remote_exists(self, path):
+        result = subprocess.run(self.ssh_base()+[self.target, "sh -c "+shlex.quote("test -f %s"%shlex.quote(path))], text=True, capture_output=True, timeout=self.c.connect_timeout+30)
+        return result.returncode == 0
+    def remote_hash(self, path):
+        result = self.ssh("if test -f {0}; then sha256sum {0} | awk '{{print $1}}'; fi".format(shlex.quote(path)), "read remote worker checksum")
+        lines=result.stdout.strip().splitlines(); return lines[-1].strip() if lines else None
+    def ensure_worker(self, run):
+        digest=hashlib.sha256(self.worker.read_bytes()).hexdigest()
+        bindir="%s/%s/bin"%(self.c.remote_base_dir,run); remote=bindir+"/full_port_recheck.py"
+        self.ssh("mkdir -p %s"%shlex.quote(bindir),"create remote worker directory")
+        if self.remote_hash(remote)!=digest:
+            partial=remote+".uploading"; self.upload(self.worker,partial,"upload remote worker")
+            self.ssh("mv -f %s %s && chmod 700 %s"%(shlex.quote(partial),shlex.quote(remote),shlex.quote(remote)),"publish remote worker")
+        if self.remote_hash(remote)!=digest: raise RemoteExecutionError("remote worker checksum mismatch")
+        return remote
+    def preflight(self, run_id):
+        self.check_credentials(); base=shlex.quote(self.c.remote_base_dir)
+        self.ssh("mkdir -p {0} && test -w {0} && command -v {1} >/dev/null && command -v {2} >/dev/null".format(base,shlex.quote(self.c.python_bin),shlex.quote(self.c.nmap_bin)),"remote full-port preflight")
+        self.ensure_worker(safe_component(run_id)); print("remote_full_port_preflight=passed host=%s"%self.c.host,flush=True)
+    def job_state(self, job):
+        q=shlex.quote(job)
+        script=("if test -f {0}/exit_code; then v=$(tr -d '[:space:]' < {0}/exit_code); case \"$v\" in ''|*[!0-9]*) echo invalid;; *) echo \"finished $v\";; esac; elif test -f {0}/pid && kill -0 \"$(cat {0}/pid)\" 2>/dev/null; then echo running; elif test -d {0}; then echo orphaned; else echo missing; fi").format(q)
+        parts=self.ssh(script,"read remote job state").stdout.strip().split()
+        if parts and parts[0]=="finished" and len(parts)==2: return "finished",int(parts[1])
+        if parts and parts[0] in {"running","missing","orphaned","invalid"}: return parts[0],None
+        raise RemoteExecutionError("invalid remote job state: %s"%" ".join(parts))
+    def upload_atomic(self, local, remote, description):
+        partial=remote+".uploading"; self.upload(local,partial,description)
+        self.ssh("mv -f %s %s"%(shlex.quote(partial),shlex.quote(remote)),"publish "+description)
+    def launch(self, job, worker, args):
+        self.ssh("mkdir -p %s"%shlex.quote(job),"create remote job directory")
+        self.upload_atomic(args.ports_input,job+"/ports_input.csv","port input")
+        self.upload_atomic(args.llm_input,job+"/llm_input.csv","LLM input")
+        checkpoint=job+"/checkpoint.jsonl"
+        if args.checkpoint.exists() and not self.remote_exists(checkpoint): self.upload_atomic(args.checkpoint,checkpoint,"full-port checkpoint")
+        argv=[self.c.python_bin,worker,"--ports-input",job+"/ports_input.csv","--llm-input",job+"/llm_input.csv","--output",job+"/new_ports.csv","--checkpoint",checkpoint,"--summary",job+"/summary.json","--mode",args.mode,"--max-targets",str(args.max_targets),"--max-rate",str(args.max_rate),"--min-rate",str(args.min_rate),"--workers",str(args.workers),"--max-retries",str(args.max_retries),"--host-timeout",args.host_timeout,"--process-timeout",str(args.process_timeout),"--nmap-bin",self.c.nmap_bin,"--resume"]
+        worker_shell="%s > worker.log 2>&1; rc=$?; printf '%%s\\n' \"$rc\" > exit_code"%" ".join(shlex.quote(x) for x in argv)
+        launcher="cd {0}; rm -f exit_code; nohup sh -c {1} </dev/null > launcher.log 2>&1 & printf '%s\\n' \"$!\" > pid".format(shlex.quote(job),shlex.quote(worker_shell))
+        self.ssh(launcher,"start remote full-port job")
+    def optional_download(self, remote, local, temp):
+        if not self.remote_exists(remote): return False
+        fetched=temp/Path(local).name; self.download(remote,fetched,"download "+Path(local).name); atomic_copy(fetched,Path(local)); return True
+    def retrieve(self, job, args, code):
+        with tempfile.TemporaryDirectory(prefix="remote_full_port_") as raw:
+            temp=Path(raw); output=temp/"new_ports.csv"; summary=temp/"summary.json"
+            self.download(job+"/new_ports.csv",output,"download remote new ports"); self.download(job+"/summary.json",summary,"download remote summary")
+            validate_result_files(output,summary); atomic_copy(output,args.output); atomic_copy(summary,args.summary)
+            self.optional_download(job+"/checkpoint.jsonl",args.checkpoint,temp)
+            self.optional_download(job+"/worker.log",args.output.with_name(args.output.stem+"_remote_worker.log"),temp)
+        if code==0: self.ssh("rm -rf %s"%shlex.quote(job),"clean completed remote job")
+    def run(self,args):
+        if args.output.is_file() and args.summary.is_file():
+            local_summary = validate_result_files(args.output, args.summary)
+            partial = int(local_summary.get("failed_or_timed_out", 0)) > 0
+            self.status("partial" if partial else "complete")
+            return 2 if partial else 0
+        self.check_credentials(); run=safe_component(args.run_id); worker=self.ensure_worker(run)
+        job="%s/%s/jobs/%s"%(self.c.remote_base_dir,run,safe_component(args.job_id)); state,code=self.job_state(job)
+        if state in {"orphaned","invalid"}: self.status("failed"); raise RemoteExecutionError("remote job is %s; directory retained: %s"%(state,job))
+        if state=="missing": self.status("uploading"); self.launch(job,worker,args); state="running"
+        self.status("running")
+        while state=="running":
+            time.sleep(self.c.poll_interval); state,code=self.job_state(job)
+            if state in {"orphaned","invalid","missing"}: self.status("failed"); raise RemoteExecutionError("remote job ended abnormally; directory retained: %s"%job)
+        self.status("downloading")
+        if code not in {0,2}:
+            try:
+                with tempfile.TemporaryDirectory(prefix="remote_full_port_failed_") as raw:
+                    temp=Path(raw); self.optional_download(job+"/checkpoint.jsonl",args.checkpoint,temp); self.optional_download(job+"/worker.log",args.output.with_name(args.output.stem+"_remote_worker.log"),temp)
+            except RemoteExecutionError: pass
+            self.status("failed"); raise RemoteExecutionError("remote full-port job failed with exit code %d; directory retained: %s"%(code,job))
+        self.retrieve(job,args,code); self.status("partial" if code==2 else "complete"); return code
+
+def parser():
+    p=argparse.ArgumentParser(description="execute full-port scan on one SSH worker")
+    p.add_argument("--config",required=True,type=Path); p.add_argument("--worker-script",required=True,type=Path); p.add_argument("--run-id",required=True); p.add_argument("--preflight",action="store_true"); p.add_argument("--job-id"); p.add_argument("--status-file",type=Path); p.add_argument("--status-prefix",default="phase=full-port-remote")
+    p.add_argument("--ports-input",type=Path); p.add_argument("--llm-input",type=Path); p.add_argument("--output",type=Path); p.add_argument("--checkpoint",type=Path); p.add_argument("--summary",type=Path)
+    p.add_argument("--mode",choices=("candidates","all"),default="candidates"); p.add_argument("--max-targets",type=int,default=50); p.add_argument("--max-rate",type=int,default=200); p.add_argument("--min-rate",type=int,default=100); p.add_argument("--workers",type=int,default=6); p.add_argument("--host-timeout",default="40m"); p.add_argument("--max-retries",type=int,default=0); p.add_argument("--process-timeout",type=int,default=2700)
+    return p
+def main(argv=None):
+    args=parser().parse_args(argv)
+    try:
+        runner=Runner(Config(args.config),args.worker_script,args.status_file,args.status_prefix)
+        if args.preflight: runner.preflight(args.run_id); return 0
+        fields=("job_id","ports_input","llm_input","output","checkpoint","summary"); missing=[x for x in fields if getattr(args,x) is None]
+        if missing: raise RemoteExecutionError("remote job missing arguments: %s"%",".join(missing))
+        return runner.run(args)
+    except RemoteExecutionError as exc:
+        print("remote_full_port_error: %s"%exc,file=sys.stderr,flush=True); return 1
+if __name__=="__main__": raise SystemExit(main())
