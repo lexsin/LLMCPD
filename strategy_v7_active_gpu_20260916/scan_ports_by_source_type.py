@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Apply -Pn by enterprise size and original source record type."""
-import argparse,csv,json,subprocess,sys
+import argparse,csv,ipaddress,json,subprocess,sys
 from pathlib import Path
 COL_START="\u8d77\u59cbIP";COL_END="\u7ec8\u6b62IP";COL_IP="ip";THRESHOLD=50000
 def read_rows(path):
@@ -18,10 +18,33 @@ def unique_ip_count(rows):
     return len({r.get(COL_IP,"").strip() for r in rows if r.get(COL_IP,"").strip()})
 def explicit_single_ips(rows):
     return {r.get(COL_START,"").strip() for r in rows if r.get(COL_START,"").strip() and r.get(COL_START,"").strip()==r.get(COL_END,"").strip()}
+def small_range_ips(rows, existing, limit=THRESHOLD):
+    """Add whole source ranges of at most 256 IPs without exceeding the limit."""
+    selected=set(existing)
+    if len(selected) >= limit:
+        return selected
+    for row in rows:
+        start=row.get(COL_START,"").strip(); end=row.get(COL_END,"").strip()
+        if not start or not end or start==end: continue
+        try:
+            first,last=ipaddress.ip_address(start),ipaddress.ip_address(end)
+            if first.version!=4 or last.version!=4: continue
+            size=int(last)-int(first)+1
+        except ValueError: continue
+        if size<2 or size>256: continue
+        members={str(ipaddress.ip_address(value)) for value in range(int(first),int(last)+1)}
+        if len(selected | members) <= limit:
+            selected.update(members)
+    return selected
 def classify_rows(rows,source_rows):
     if unique_ip_count(rows)<THRESHOLD:return rows,[],"all_pn_below_50000"
     singles=explicit_single_ips(source_rows)
-    return ([r for r in rows if r.get(COL_IP,"").strip() in singles],[r for r in rows if r.get(COL_IP,"").strip() not in singles],"single_source_pn_range_source_discovery")
+    # Explicit single-IP source records always use -Pn, even above 50,000.
+    # Small ranges are an expansion only while that initial group is below
+    # 50,000, and the expanded -Pn group must not exceed 50,000.
+    pn_ips=small_range_ips(source_rows,singles) if len(singles)<THRESHOLD else singles
+    policy="single_and_small_range_pn_range_source_discovery" if len(pn_ips)>len(singles) else "single_source_pn_range_source_discovery"
+    return ([r for r in rows if r.get(COL_IP,"").strip() in pn_ips],[r for r in rows if r.get(COL_IP,"").strip() not in pn_ips],policy)
 def run_scanner(args,mode,rows,fields):
     if not rows:return None
     mode_dir=args.work_dir/mode;input_path=mode_dir/"input.csv";output_path=mode_dir/"scan_result.csv";write_rows(input_path,rows,fields)
@@ -48,7 +71,8 @@ def parse_args():
     p.add_argument("--batch-size",type=int,default=500);p.add_argument("--parallel-workers",type=int,default=12);p.add_argument("--verify-workers",type=int,default=12);p.add_argument("--min-rate",default="3000");p.add_argument("--max-retries",default="1");p.add_argument("--host-timeout",default="120s");return p.parse_args()
 def main():
     args=parse_args();rows,fields=read_rows(args.input);source_rows,_=read_rows(args.source);pn,discovery,policy=classify_rows(rows,source_rows);args.work_dir.mkdir(parents=True,exist_ok=True)
-    summary={"policy":policy,"threshold":THRESHOLD,"total_unique_ips":unique_ip_count(rows),"explicit_single_source_ips":len(explicit_single_ips(source_rows)),"pn_unique_ips":unique_ip_count(pn),"host_discovery_unique_ips":unique_ip_count(discovery)}
+    explicit_singles=explicit_single_ips(source_rows)
+    summary={"policy":policy,"threshold":THRESHOLD,"total_unique_ips":unique_ip_count(rows),"explicit_single_source_ips":len(explicit_singles),"small_range_pn_ips":max(0,unique_ip_count(pn)-len(explicit_singles)),"pn_unique_ips":unique_ip_count(pn),"host_discovery_unique_ips":unique_ip_count(discovery)}
     (args.work_dir/"mode_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2)+"\n",encoding="utf-8");print(json.dumps(summary,ensure_ascii=False),flush=True)
     merge_results(rows,fields,[run_scanner(args,"pn",pn,fields),run_scanner(args,"host_discovery",discovery,fields)],args.output)
 if __name__=="__main__":main()

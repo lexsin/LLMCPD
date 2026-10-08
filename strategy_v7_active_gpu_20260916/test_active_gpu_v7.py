@@ -3,9 +3,18 @@
 import asyncio
 
 import active_gpu_inference_probe as active_probe
-from active_gpu_recheck import choose_model, is_candidate, updated_row
-from scan_llm import ProbeResult, TargetState, _gpu_evidence_tiers, _read_metrics_content
-from scan_config import get_default_config
+from active_gpu_recheck import (
+    choose_model,
+    is_candidate,
+    updated_row,
+    video_history_probe,
+)
+try:
+    from scan_llm import ProbeResult, TargetState, _gpu_evidence_tiers, _read_metrics_content
+    from scan_config import get_default_config
+    HAS_SCAN_LLM = True
+except (ImportError, SystemExit):
+    HAS_SCAN_LLM = False
 
 
 class FakeContent:
@@ -127,10 +136,99 @@ def verify_read_timeout_keeps_fast_ps_observation():
     assert calls["ps"] > calls["metrics"]
 
 
+def verify_sglang_native_generate_payload_and_route_discovery():
+    path, payload = active_probe.inference_request(
+        "sglang", "text-model", 6, "/generate"
+    )
+    assert path == "/generate"
+    assert payload == {
+        "text": "Reply with OK.",
+        "sampling_params": {"temperature": 0, "max_new_tokens": 6},
+    }
+
+
+def verify_video_history_requires_complete_runtime_evidence():
+    completed = {
+        "data": [{
+            "id": "video-1", "model": "MiniMax-H3-fl2v",
+            "status": "completed", "peak_memory_mb": 10626.0,
+            "num_outputs": 1, "file_path": "outputs/video-1.mp4",
+        }]
+    }
+    captured = []
+    original_get_text = __import__("active_gpu_recheck").get_text
+    try:
+        __import__("active_gpu_recheck").get_text = lambda *args, **kwargs: (
+            200, __import__("json").dumps(completed), ""
+        )
+        result = video_history_probe(
+            "http://182.140.218.64:30010",
+            "MiniMax-H3-fl2v",
+            ["MiniMax-H3-fl2v"],
+            evidence_callback=captured.append,
+        )
+    finally:
+        __import__("active_gpu_recheck").get_text = original_get_text
+    assert result["recommended_gpu_likelihood"] == "高"
+    assert "peak_memory_mb=10626" in result["direct_gpu_evidence"][0]
+    assert "10.4 GiB" in result["direct_gpu_evidence"][0]
+    assert captured[0]["_evidence_url"].endswith("/v1/videos?limit=10")
+
+    invalid_records = [
+        {"status": "running", "peak_memory_mb": 10626, "num_outputs": 1},
+        {"status": "completed", "model": "other", "peak_memory_mb": 10626, "num_outputs": 1},
+        {"status": "completed", "model": "MiniMax-H3-fl2v", "peak_memory_mb": 0, "num_outputs": 1},
+        {"status": "completed", "model": "MiniMax-H3-fl2v", "peak_memory_mb": 10626, "num_outputs": 0},
+    ]
+    try:
+        __import__("active_gpu_recheck").get_text = lambda *args, **kwargs: (
+            200, __import__("json").dumps({"data": invalid_records}), ""
+        )
+        result = video_history_probe(
+            "http://192.0.2.10:30010",
+            "MiniMax-H3-fl2v",
+            ["MiniMax-H3-fl2v"],
+        )
+    finally:
+        __import__("active_gpu_recheck").get_text = original_get_text
+    assert result["recommended_gpu_likelihood"] == "中"
+    assert result["direct_gpu_evidence"] == []
+
+
+def verify_passive_video_row_status_and_wording():
+    row = {
+        "ip": "182.140.218.64", "port": "30010", "protocol": "http",
+        "gpu_likelihood": "中", "is_llm": "确认", "deploy_tool": "sglang",
+        "model_info": "MiniMax-H3-fl2v", "gpu_evidence": "",
+    }
+    evidence = (
+        "GET /v1/videos?limit=10: completed video id=video-1 "
+        "model=MiniMax-H3-fl2v peak_memory_mb=10626 (10.4 GiB)"
+    )
+    revised = updated_row(row, {
+        "base_url": "http://182.140.218.64:30010",
+        "model": "MiniMax-H3-fl2v",
+        "probe_mode": "passive_video_history",
+        "direct_gpu_evidence": [evidence],
+        "first_direct_evidence_at": "video-history",
+        "inference": {"path": "/v1/videos?limit=10", "status": 200},
+        "model_task_type": "TI2V",
+    })
+    assert revised["gpu_likelihood"] == "高"
+    assert revised["active_probe_status"] == "passive_video_gpu_confirmed"
+    assert "主动推理" not in revised["分析"]
+    assert revised["link"] == "http://182.140.218.64:30010/v1/videos?limit=10"
+
+
 if __name__ == "__main__":
-    asyncio.run(verify_streaming_metrics())
+    if HAS_SCAN_LLM:
+        asyncio.run(verify_streaming_metrics())
     verify_active_selection_and_promotion()
-    verify_model_inventory_is_configuration_evidence()
+    if HAS_SCAN_LLM:
+        verify_model_inventory_is_configuration_evidence()
     verify_configuration_only_high_is_rechecked_and_downgraded()
     verify_read_timeout_keeps_fast_ps_observation()
+    verify_sglang_native_generate_payload_and_route_discovery()
+    verify_video_history_requires_complete_runtime_evidence()
+    verify_passive_video_row_status_and_wording()
     print("active_gpu_v7_tests=passed")

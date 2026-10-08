@@ -132,7 +132,12 @@ def ollama_vram_evidence(body: str) -> List[str]:
     return hits[:10]
 
 
-def inference_request(tool: str, model: str, tokens: int) -> Tuple[str, dict]:
+def inference_request(
+    tool: str,
+    model: str,
+    tokens: int,
+    path: str = "",
+) -> Tuple[str, dict]:
     if tool == "ollama":
         return "/api/generate", {
             "model": model, "prompt": "Reply with OK.", "stream": False,
@@ -145,11 +150,38 @@ def inference_request(tool: str, model: str, tokens: int) -> Tuple[str, dict]:
             "inputs": "Reply with OK.",
             "parameters": {"max_new_tokens": tokens, "do_sample": False},
         }
+    if tool == "sglang" and path == "/generate":
+        return "/generate", {
+            "text": "Reply with OK.",
+            "sampling_params": {"temperature": 0, "max_new_tokens": tokens},
+        }
     return "/v1/chat/completions", {
         "model": model,
         "messages": [{"role": "user", "content": "Reply with OK."}],
         "max_tokens": tokens, "temperature": 0, "stream": False,
     }
+
+
+def sglang_inference_paths(base_url: str) -> Tuple[List[str], str]:
+    """Choose text-generation routes from OpenAPI, with a safe 404 fallback."""
+    status, body, _ = get_text(new_session(), base_url.rstrip("/") + "/openapi.json")
+    if status == 200:
+        try:
+            data = json.loads(body)
+        except (TypeError, json.JSONDecodeError):
+            data = None
+        paths = data.get("paths") if isinstance(data, dict) else None
+        if isinstance(paths, dict):
+            available = []
+            for path in ("/v1/chat/completions", "/generate"):
+                methods = paths.get(path)
+                if isinstance(methods, dict) and "post" in {
+                    str(method).lower() for method in methods
+                }:
+                    available.append(path)
+            if available:
+                return available, "openapi"
+    return ["/v1/chat/completions", "/generate"], "fallback_on_404"
 
 
 def read_snapshot(base_url: str, label: str) -> dict:
@@ -273,24 +305,52 @@ def run_one(
     record(read_metrics_snapshot(base_url, "before-metrics"))
     if tool == "ollama":
         record(read_ps_snapshot(base_url, "before-ps"))
-    path, payload = inference_request(tool, model, tokens)
+    if tool == "sglang":
+        inference_paths, route_source = sglang_inference_paths(base_url)
+    else:
+        inference_paths, route_source = [""], "tool_default"
+    path, payload = inference_request(tool, model, tokens, inference_paths[0])
     inference: Dict[str, object] = {
         "path": path, "status": 0, "error": "", "error_type": "",
         "timed_out": False, "elapsed_seconds": 0.0,
+        "route_source": route_source, "attempts": [],
     }
 
     def send() -> None:
         started = time.monotonic()
         try:
-            response = new_session().post(
-                base_url + path, json=payload, timeout=(5, timeout), verify=False,
-            )
-            inference["status"] = response.status_code
-            inference["response_excerpt"] = response.text[:500]
-        except requests.RequestException as exc:
-            inference["error_type"] = type(exc).__name__
-            inference["timed_out"] = isinstance(exc, requests.exceptions.ReadTimeout)
-            inference["error"] = "%s: %s" % (type(exc).__name__, str(exc)[:300])
+            for index, candidate_path in enumerate(inference_paths):
+                candidate_path, candidate_payload = inference_request(
+                    tool, model, tokens, candidate_path
+                )
+                try:
+                    response = new_session().post(
+                        base_url + candidate_path,
+                        json=candidate_payload,
+                        timeout=(5, timeout),
+                        verify=False,
+                    )
+                    inference["attempts"].append({
+                        "path": candidate_path,
+                        "status": response.status_code,
+                        "response_excerpt": response.text[:500],
+                    })
+                    inference["path"] = candidate_path
+                    inference["status"] = response.status_code
+                    inference["response_excerpt"] = response.text[:500]
+                    if response.status_code != 404 or index == len(inference_paths) - 1:
+                        break
+                except requests.RequestException as exc:
+                    inference["path"] = candidate_path
+                    inference["error_type"] = type(exc).__name__
+                    inference["timed_out"] = isinstance(exc, requests.exceptions.ReadTimeout)
+                    inference["error"] = "%s: %s" % (type(exc).__name__, str(exc)[:300])
+                    inference["attempts"].append({
+                        "path": candidate_path,
+                        "status": 0,
+                        "error": inference["error"],
+                    })
+                    break
         finally:
             inference["elapsed_seconds"] = round(time.monotonic() - started, 3)
 

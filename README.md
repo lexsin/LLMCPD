@@ -52,6 +52,41 @@ flowchart LR
 
 ---
 
+## 推荐端口扫描参数
+
+对齐 2026-08-18 16-worker 复扫（`scripts/run_rescan_configurable_20260818.sh`）。大规模段（数十万 IP）按此配置；脚本 CLI 默认仍是 1 worker / batch 100，**生产不要用默认值**。改正在跑的任务只能 stop + `--resume`，不要无缓存重开。
+
+```bash
+sudo python3 ip_port_scan.py \
+  --input  data/<stem>_result.csv \
+  --output data/<stem>_scan_result.csv \
+  --cache  data/<stem>_port_cache.json \
+  --checkpoint data/<stem>_port_checkpoint.jsonl \
+  --batch-size 500 \
+  --parallel-workers 16 \
+  --verify-workers 16 \
+  --min-rate 3000 \
+  --max-retries 1 \
+  --host-timeout 120s \
+  --stats-every 60s \
+  --resume
+```
+
+| 参数 | 推荐 | 脚本默认 | 说明 |
+| --- | --- | --- | --- |
+| `--batch-size` | `500` | `100` | 每批 IP 数 |
+| `--parallel-workers` | `16` | `1` | 并行 nmap 批次数 |
+| `--verify-workers` | `16` | `8` | 异常 IP 的 `-sV` 并发 |
+| `--min-rate` | `3000` | `1500` | nmap 发包下限 |
+| `--max-retries` | `1` | `2` | nmap 重试 |
+| `--host-timeout` | `120s` | `300s` | 单主机超时 |
+| `--host-discovery` | **不加**（保持 `-Pn`） | 关 | 仅当 IP 行数 > 50000 且该任务明确走 8-18 的 host-discovery 分支时才开 |
+| `--low-open-confirm` | **不加** | 关 | 见下 |
+
+**不要默认开 `--low-open-confirm`。** 开放率 < 0.5% 或开放 IP < 5 就会触发；复核在主线程 `flush`，会堵住 16 worker。新疆段实测 59/59 次均为 `sample_confirm_only`（抽样新增开放 IP = 0）。历史 checkpoint 约 3.6 万次中 99.7% 为白扫，仅 0.3% 扩成整批复扫，且从未 extra-port 扩展。只在有漏检证据的单任务上打开。
+
+---
+
 ## 脚本一览
 
 
@@ -120,9 +155,9 @@ python3 ip_ping_check.py --data-dir data/990000762670.xls --col-start START_IP -
 对 CSV 中 **每个唯一 IP** 用 nmap 扫描 **488 个指定端口**（非全端口），将开放端口写入 `open_ports`（分号分隔）。
 
 - **IPv4 / IPv6 自动分扫**：IPv6 使用 `nmap -6`
-- **分批扫描**：默认每批 100 IP，打印 IP 级进度与 ETA
-- **每批落盘**：每批完成后更新 `port_scan_cache.json` 并重写输出 CSV
-- `**--resume`**：跳过 cache 中已有记录，继续未扫 IP（**仅认 `port_scan_cache.json`**，不读 `scan_v4_batch_*.xml`）
+- **分批扫描**：脚本默认每批 100 IP；生产推荐见上文「推荐端口扫描参数」
+- **每批落盘**：每批完成后更新 cache 并追加 checkpoint；最终 CSV 在扫描结束时写出
+- `**--resume`**：跳过 cache 中已有记录，继续未扫 IP（**仅认 cache**，不读 `scan_v4_batch_*.xml`）
 
 ### 输入
 
@@ -136,17 +171,19 @@ python3 ip_ping_check.py --data-dir data/990000762670.xls --col-start START_IP -
 ### 常用命令
 
 ```bash
-# 基本扫描
-sudo python3 ip_port_scan.py --input data/990000762670_result.csv
-
-# 断点续扫（跳过 cache 中已有 IP，例如只补扫 IPv6）
-sudo python3 ip_port_scan.py --input data/990000762670_result.csv --resume
-
-# 指定输出、每批 200 IP
+# 生产推荐（对齐 8-18 16-worker；完整说明见上文「推荐端口扫描参数」）
 sudo python3 ip_port_scan.py \
   --input data/990000762670_result.csv \
-  --output data/990000762670_scan_result.csv \
-  --batch-size 200
+  --batch-size 500 \
+  --parallel-workers 16 \
+  --verify-workers 16 \
+  --min-rate 3000 \
+  --max-retries 1 \
+  --host-timeout 120s \
+  --resume
+
+# 仅续扫（参数必须与上次一致，或按推荐参数重开 + --resume）
+sudo python3 ip_port_scan.py --input data/990000762670_result.csv --resume
 ```
 
 ### 参数
@@ -159,7 +196,14 @@ sudo python3 ip_port_scan.py \
 | `--xml`              | `scan.xml`               | 派生 `scan_v4.xml`、`scan_v6.xml` |
 | `--ip-list`          | `ips_scan.txt`           | 全量 IP 列表备份                     |
 | `--cache`            | `port_scan_cache.json`   | 端口结果缓存（断点依据）                   |
-| `--batch-size`       | `100`                    | 每批 IP 数；`0` 表示不分批              |
+| `--batch-size`       | `100`（推荐 `500`）          | 每批 IP 数；`0` 表示不分批              |
+| `--parallel-workers` | `1`（推荐 `16`）             | 并行 nmap 批次数                     |
+| `--verify-workers`   | `8`（推荐 `16`）             | 异常 IP 的 `-sV` 并发                |
+| `--min-rate`         | `1500`（推荐 `3000`）        | nmap `--min-rate`               |
+| `--max-retries`      | `2`（推荐 `1`）              | nmap `--max-retries`            |
+| `--host-timeout`     | `300s`（推荐 `120s`）        | nmap `--host-timeout`           |
+| `--host-discovery`   | 关（保持 `-Pn`）             | 开启后做主机发现；大规模默认仍建议 `-Pn`        |
+| `--low-open-confirm` | 关（生产默认不要开）             | 低开放率批次抽样复核；见「推荐端口扫描参数」         |
 | `--resume`           | 关                        | 跳过 cache 中已有 IP                |
 | `--stats-every`      | `60s`                    | nmap 进度统计间隔；`0` 关闭             |
 | `--skip-scan`        | 关                        | 不跑 nmap，仅从已有 XML 合并            |
@@ -379,11 +423,15 @@ python3 ip_ping_check.py \
   --col-start START_IP --col-end END_IP \
   --skip-ping
 
-# 2) 端口扫描（中断后用 --resume 续扫，例如补 IPv6）
+# 2) 端口扫描（推荐 16-worker；中断后用 --resume 续扫）
 sudo python3 ip_port_scan.py \
   --input data/990000762670_result.csv \
-  --batch-size 100 \
-  --parallel-workers 2 \
+  --batch-size 500 \
+  --parallel-workers 16 \
+  --verify-workers 16 \
+  --min-rate 3000 \
+  --max-retries 1 \
+  --host-timeout 120s \
   --resume
 
 # 3) 展开端口，供 LLM 扫描

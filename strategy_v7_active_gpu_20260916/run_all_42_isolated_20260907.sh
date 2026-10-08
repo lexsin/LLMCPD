@@ -3,7 +3,7 @@ set -Eeuo pipefail
 ROOT=/home/lixiao/llm-detect/TEST
 ISO="$ROOT/strategy_v7_active_gpu_20260916"
 RUN_ID="${RUN_ID:-rescan_all_isolated_v7_active_gpu_20260916}"
-EXPECTED_LOCATIONS="${EXPECTED_LOCATIONS:-41}"
+EXPECTED_LOCATIONS="${EXPECTED_LOCATIONS:-40}"
 RUN_DIR="$ROOT/data/$RUN_ID"
 LOG_DIR="$ROOT/logs/$RUN_ID"
 STATUS_FILE="$LOG_DIR/status.txt"
@@ -87,8 +87,7 @@ run_one() {
   local evidence_manifest="$evidence_assets/manifest.json"
   local final_input="$llm_rechecked"
   local final="$stage/${location}_llm_最终版.xlsx"
-  local mode=pn
-  local host_args=()
+  local mode=source-type-policy
   [ ! -f "$stage/COMPLETE" ] || {
     log "[$index/$total] 已完成，跳过: $location"
     return 0
@@ -108,17 +107,12 @@ run_one() {
       --skip-ping --dedup-ip --max-expand 2048 --expand-all || return $?
   fi
   local ip_rows=$(( $(wc -l < "$result") - 1 ))
-  if [ "$ip_rows" -gt 50000 ]; then
-    mode=host-discovery
-    host_args+=(--host-discovery)
-  fi
   status "phase=ports index=$index total=$total current=$location attempt=$attempt ip_rows=$ip_rows mode=$mode"
-  python3 "$ISO/ip_port_scan.py" \
-    --input "$result" --output "$scan_result" --cache "$cache" \
-    --checkpoint "$port_checkpoint" --batch-size 500 \
-    --parallel-workers 12 --verify-workers 12 --min-rate 3000 \
-    --max-retries 1 --host-timeout 120s \
-    "${host_args[@]}" --resume || return $?
+  python3 "$ISO/scan_ports_by_source_type.py" \
+    --source "$input" --input "$result" --output "$scan_result" \
+    --work-dir "$stage/port_scan_modes" --scanner "$ISO/ip_port_scan.py" \
+    --batch-size 500 --parallel-workers 12 --verify-workers 12 \
+    --min-rate 3000 --max-retries 1 --host-timeout 120s || return $?
   status "phase=expand-ports index=$index total=$total current=$location attempt=$attempt ip_rows=$ip_rows mode=$mode"
   if ! python3 "$ISO/expand_scan_ports.py" \
       --input "$scan_result" --output "$scan_ports"; then
