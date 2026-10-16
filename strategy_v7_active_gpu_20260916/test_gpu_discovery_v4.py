@@ -133,6 +133,16 @@ paths = _openapi_hardware_paths(
 )
 assert paths == ["/v1/hardware", "/v1/cluster/info"], paths
 
+semantic_paths = _openapi_hardware_paths(
+    '{"paths":{'
+    '"/api/status":{"get":{"summary":"GPU memory telemetry"}},'
+    '"/api/v1/resource":{"get":{"operationId":"get_gpu_memory_info"}},'
+    '"/api/restart":{"get":{"summary":"GPU device information"}},'
+    '"/api/gpu":{"get":{"parameters":[{"name":"refresh","in":"query","required":true}]}}'
+    '}}'
+)
+assert semantic_paths == ["/api/v1/resource", "/api/status"], semantic_paths
+
 
 async def validate_adaptive_probe():
     calls = []

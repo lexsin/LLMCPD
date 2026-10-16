@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from subprocess import PIPE, STDOUT, TimeoutExpired, run
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
@@ -86,9 +87,15 @@ def split_urls(value):
 def evidence_kind(note):
     text = str(note or "")
     lowered = text.lower()
+    if re.search(r"npu|ascend|mindie|davinci|vdie", lowered):
+        return "npu"
     if "/api/ps" in lowered or "size_vram" in lowered or "显存" in text:
         return "vram"
-    if any(token in lowered for token in ("/metrics", "dcgm", "gpu_memory", "vllm_gpu", "gpu_uuid", "nv_gpu")):
+    if any(token in lowered for token in (
+        "/metrics", "dcgm", "gpu_memory", "gpu-memory", "vllm_gpu", "gpu_uuid",
+        "nv_gpu", "/api/training/gpu-memory-info", "/api/training/all-gpus-info",
+        "/api/training/device-info", "has_gpu", "gpu_name",
+    )):
         return "metrics"
     return "models"
 
@@ -102,10 +109,16 @@ def score_url(url, kind):
         if "/api/tags" in url:
             return 3
         return 9
-    if kind == "metrics":
-        if "/metrics" in url:
+    if kind in {"metrics", "npu"}:
+        lowered = url.lower()
+        if any(path in lowered for path in (
+            "/api/training/gpu-memory-info", "/api/training/all-gpus-info",
+            "/api/training/device-info",
+        )):
             return 0
-        if "/v1/models" in url:
+        if "/metrics" in lowered:
+            return 1
+        if "/v1/models" in lowered:
             return 2
         return 9
     if "/v1/models" in url:
@@ -121,10 +134,87 @@ def score_url(url, kind):
     return 8
 
 
+def select_evidence_note(gpu_note, npu_note="", gpu_level="", npu_level=""):
+    """Choose the accelerator conclusion which the single proof image supports."""
+    def rank(value):
+        low = str(value or "").strip().lower()
+        if low in {"high", "高"} or "可能性高" in low:
+            return 3
+        if low in {"medium", "中"} or "可能性中" in low:
+            return 2
+        if low in {"low", "低"} or "可能性较低" in low:
+            return 1
+        return 0
+    gpu_rank, npu_rank = rank(gpu_level), rank(npu_level)
+    if npu_note and npu_rank >= 2 and npu_rank > gpu_rank:
+        return str(npu_note)
+    # A generic "no NPU evidence" message must not redirect ordinary GPU/LLM
+    # screenshots into the NPU-only validation path.
+    return str(gpu_note or "")
+
+
+def cited_evidence_paths(note):
+    paths = []
+    for path in re.findall(r"(?<![\w/:])(/[A-Za-z0-9_][A-Za-z0-9_./-]*)", str(note or "")):
+        path = path.rstrip(".")
+        if ".." in path.split("/") or not re.search(
+            r"metrics|prometheus|api/ps|gpu|npu|ascend|hardware|device", path, re.I
+        ):
+            continue
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
 def preferred_urls(links, note):
     kind = evidence_kind(note)
     urls = split_urls(links)
-    return sorted(urls, key=lambda url: score_url(url, kind))
+    cited = cited_evidence_paths(note)
+    origins = []
+    for url in urls:
+        parsed = urlsplit(url)
+        origin = (parsed.scheme, parsed.netloc)
+        if parsed.scheme in {"http", "https"} and parsed.netloc and origin not in origins:
+            origins.append(origin)
+    explicit = [
+        urlunsplit((scheme, netloc, path, "", ""))
+        for scheme, netloc in origins for path in cited
+    ]
+    ordered = list(dict.fromkeys(explicit + urls))
+    return sorted(ordered, key=lambda url: (
+        0 if urlsplit(url).path in cited else 1, score_url(url, kind)
+    ))
+
+
+def npu_metric_names(note):
+    return sorted(set(re.findall(
+        r"\b(?:npu|ascend|mindie|davinci)_[A-Za-z0-9_]+", str(note or "")
+    )))
+
+
+def response_matches_note(response, note):
+    if evidence_kind(note) != "npu":
+        return True
+    _, content_type, body = response
+    if "html" in str(content_type).lower():
+        return False
+    text = response_text(content_type, body)
+    named = npu_metric_names(note)
+    if named:
+        return all(re.search(r"(?m)^" + re.escape(name) + r"(?:\{|\s)", text)
+                   for name in named)
+    return bool(re.search(r"npu|ascend|mindie|davinci|vdie", text, re.I))
+
+
+def reusable_precapture(record, note, urls):
+    if evidence_kind(note) != "npu":
+        return True
+    return (
+        record.get("proof_version") == 2
+        and record.get("evidence_kind") == "npu"
+        and record.get("evidence_metrics", []) == npu_metric_names(note)
+        and record.get("url") in urls[:max(1, len(cited_evidence_paths(note)))]
+    )
 
 
 def fetch_response(url):
@@ -153,9 +243,17 @@ def fetch_response(url):
                         if any(token in low for token in (
                             b"gpu", b"nvidia", b"dcgm", b"nvml", b"cuda",
                             b"vram", b"hbm", b"accelerator", b"cache_config_info",
+                            b"npu", b"ascend", b"mindie", b"davinci", b"vdie",
                         )) and len(relevant) < 2 * 1024 * 1024:
                             relevant.extend(line[: 2 * 1024 * 1024 - len(relevant)])
-                body = bytes(prefix) + b"\n# filtered_gpu_metrics\n" + bytes(relevant)
+                if pending:
+                    low = pending.lower()
+                    if any(token in low for token in (
+                        b"gpu", b"npu", b"ascend", b"mindie", b"davinci",
+                        b"vdie", b"vram", b"hbm", b"nvidia", b"dcgm",
+                    )):
+                        relevant.extend(pending[:max(0, 2 * 1024 * 1024 - len(relevant))])
+                body = bytes(prefix) + b"\n# filtered_accelerator_metrics\n" + bytes(relevant)
             else:
                 body = response.read(2 * 1024 * 1024)
             if 200 <= response.status < 400 and body:
@@ -205,7 +303,8 @@ def response_text(content_type, body):
 
 GPU_EVIDENCE_RE = re.compile(
     r"gpu|nvidia|dcgm|nvml|cuda|vram|hbm|accelerator|"
-    r"size_vram|memory_(?:used|total|utilization)|vllm_gpu|nv_gpu|gpu_uuid",
+    r"size_vram|memory_(?:used|total|utilization)|vllm_gpu|nv_gpu|gpu_uuid|"
+    r"npu|ascend|mindie|davinci|vdie",
     flags=re.IGNORECASE,
 )
 
@@ -249,9 +348,15 @@ def response_card_lines(content_type, body, evidence_note="", max_lines=36):
             return selected[:max_lines], bool(evidence_indexes)
         return source_lines[:max_lines], bool(evidence_indexes)
 
-    if kind not in {"metrics", "vram"} or not evidence_indexes:
+    if kind not in {"metrics", "vram", "npu"} or not evidence_indexes:
         visible = source_lines[:max_lines]
         return visible, bool(evidence_indexes)
+
+    # Compact JSON endpoint responses are already reviewable in full.  Keep
+    # every field so a GPU-memory explanation cannot be paired with a cropped
+    # response that shows only the device name.
+    if "json" in str(content_type or "").lower() and len(source_lines) <= max_lines:
+        return source_lines, True
 
     # Prefer the exact metric names named in the conclusion.  A Prometheus
     # endpoint can expose hundreds of GPU lines; taking only the first ones
@@ -259,6 +364,7 @@ def response_card_lines(content_type, body, evidence_note="", max_lines=36):
     # the workbook.
     generic_markers = {
         "gpu", "vram", "hbm", "cuda", "nvidia", "dcgm", "nvml", "accelerator",
+        "npu", "ascend", "mindie", "davinci", "vdie",
     }
     note_markers = {
         marker.lower()
@@ -441,23 +547,37 @@ def capture_csv_evidence(source, assets, manifest_path, limit=None):
         port = row.get("port", "")
         protocol = row.get("protocol", "")
         likelihood = str(row.get("gpu_likelihood", "")).strip().lower()
-        if likelihood not in {"高", "中", "低", "high", "medium", "low"}:
+        npu_likelihood = str(row.get("npu_likelihood", "")).strip().lower()
+        if (
+            likelihood not in {"高", "中", "低", "high", "medium", "low"}
+            and npu_likelihood not in {"高", "中", "high", "medium"}
+        ):
             continue
         if not ip or not port or protocol not in {"http", "https"}:
             continue
         key = evidence_key(ip, port, protocol)
         existing = records.get(key) or {}
-        if existing.get("path") and Path(existing["path"]).is_file():
-            continue
-        note = row.get("gpu_evidence", "") or row.get("npu_evidence", "") or row.get("evidence", "")
+        note = select_evidence_note(
+            row.get("gpu_evidence", ""), row.get("npu_evidence", ""),
+            likelihood, npu_likelihood,
+        ) or row.get("evidence", "")
         urls = preferred_urls(row.get("link", ""), note)
+        if (
+            existing.get("path") and Path(existing["path"]).is_file()
+            and reusable_precapture(existing, note, urls)
+        ):
+            continue
         selected = None
         response = None
         for url in urls:
             response = fetch_response(url)
-            if response is not None:
+            if response is not None and response_matches_note(response, note):
                 selected = url
                 break
+        if not selected and evidence_kind(note) == "npu":
+            # Never present an unrelated root page or reconstructed summary as
+            # a replacement for the NPU runtime response.
+            continue
         if not selected:
             selected = "%s://%s:%s/" % (protocol, ip, port)
             text = "扫描阶段的原始 HTTP 响应\n\n%s" % (row.get("evidence", "") or note)
@@ -478,6 +598,9 @@ def capture_csv_evidence(source, assets, manifest_path, limit=None):
             "url": selected,
             "captured_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
             "source": str(Path(source).resolve()),
+            "proof_version": 2,
+            "evidence_kind": evidence_kind(note),
+            "evidence_metrics": npu_metric_names(note),
         }
         save_manifest(manifest_path, records)
         captured += 1
@@ -500,6 +623,9 @@ def fill_workbook(
     for sheet in sheets:
         link_column = find_column(sheet, "访问链接")
         note_column = find_column(sheet, "存在GPU算力的说明")
+        npu_note_column = find_column(sheet, "NPU算力说明")
+        gpu_level_column = find_column(sheet, "存在GPU算力概率")
+        npu_level_column = find_column(sheet, "NPU算力可能性")
         image_column = find_column(sheet, "证明截图")
         ip_column = find_column(sheet, "IP地址")
         port_column = find_column(sheet, "端口号")
@@ -514,6 +640,13 @@ def fill_workbook(
                 continue
             if blank_only and row in occupied:
                 continue
+            note = select_evidence_note(
+                sheet.cell(row, note_column).value if note_column else "",
+                sheet.cell(row, npu_note_column).value if npu_note_column else "",
+                sheet.cell(row, gpu_level_column).value if gpu_level_column else "",
+                sheet.cell(row, npu_level_column).value if npu_level_column else "",
+            )
+            urls = preferred_urls(sheet.cell(row, link_column).value, note)
             pre_key = evidence_key(
                 sheet.cell(row, ip_column).value if ip_column else "",
                 sheet.cell(row, port_column).value if port_column else "",
@@ -521,7 +654,7 @@ def fill_workbook(
             )
             pre_record = pre_captured.get(pre_key) or {}
             pre_path = Path(pre_record.get("path", "")) if pre_record.get("path") else None
-            if pre_path and pre_path.is_file():
+            if pre_path and pre_path.is_file() and reusable_precapture(pre_record, note, urls):
                 if row in occupied:
                     remove_image_at(sheet, row, image_column)
                     occupied.discard(row)
@@ -532,15 +665,11 @@ def fill_workbook(
             if manifest_only:
                 records.append((sheet.title, row, "无预先截图", ""))
                 continue
-            urls = preferred_urls(
-                sheet.cell(row, link_column).value,
-                sheet.cell(row, note_column).value if note_column else "",
-            )
             selected = None
             response = None
             for url in urls:
                 response = fetch_response(url)
-                if response is not None:
+                if response is not None and response_matches_note(response, note):
                     selected = url
                     break
             if not selected or response is None:
@@ -555,7 +684,6 @@ def fill_workbook(
                     records.append((sheet.title, row, "未获取到有效响应", ""))
                 continue
             path = assets / f"{sheet.title}_{row}.png"
-            note = sheet.cell(row, note_column).value if note_column else ""
             captured = capture_response_card(
                 selected, response, path, font_path, note
             )

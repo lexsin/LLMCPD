@@ -401,6 +401,9 @@ phase2:
         - source: "get:/metrics"
           type: body_substring
           value: "vllm_"
+        - source: "get:/metrics"
+          type: body_substring
+          value: "vllm:"
 
     - name: TensorRT-LLM
       scope: [confirmed]
@@ -449,9 +452,14 @@ phase2:
       scope: [confirmed]
       requires_cached_ok: /v1/models
       match:
-        source: "get:/get_server_info"
-        type: body_substring_ci
+        source: "cached:/v1/models"
+        type: json_nested_contains_ci
+        json_path: "data.0.owned_by"
         value: sglang
+      supplements:
+        - source: "get:/get_server_info"
+          type: body_substring_ci
+          value: sglang
 
     - name: litellm
       scope: [confirmed]
@@ -608,6 +616,9 @@ phase3:
 ai_service:
   gpu_probe_paths:
     - /metrics
+    - /metrics/
+    - /prometheus
+    - /actuator/prometheus
     - /api/ps
   gpu_keywords:
     - cuda
@@ -629,10 +640,19 @@ ai_service:
     - gpu_device_count
     - nv_gpu_
     - tritonserver_gpu
+    - rocm_smi
+    - amd_smi
+    - amdgpu
+    - gpu_memory_used
+    - gpu_memory_usage
+    - gpu_utilization
   gpu_inference_keywords:
     - nv_inference_
     - nv_model_
     - vllm_
+    - "vllm:"
+    - sglang_
+    - "sglang:"
     - tgi_
     - triton_inference
   tensorrt_llm_keywords:

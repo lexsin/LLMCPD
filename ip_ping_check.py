@@ -17,7 +17,10 @@ INPUT_SUFFIXES = (".csv", ".xls", ".xlsx")
 
 
 def expand_range(
-    start_str: str, end_str: str, max_expand: int = DEFAULT_MAX_EXPAND
+    start_str: str,
+    end_str: str,
+    max_expand: int = DEFAULT_MAX_EXPAND,
+    expand_all: bool = False,
 ) -> Tuple[List[str], bool]:
     start = ipaddress.ip_address(start_str.strip())
     end = ipaddress.ip_address(end_str.strip())
@@ -25,10 +28,14 @@ def expand_range(
         raise ValueError("%s > %s" % (start_str, end_str))
 
     size = int(end) - int(start) + 1
-    if size > max_expand:
+    if size > max_expand and not expand_all:
         return [str(start), str(end)], True
 
-    return [str(ipaddress.ip_address(i)) for i in range(int(start), int(end) + 1)], False
+    ips = [
+        str(ipaddress.ip_address(i))
+        for i in range(int(start), int(end) + 1)
+    ]
+    return ips, size > max_expand
 
 
 def ping_one(ip: str, timeout_sec: float) -> str:
@@ -150,6 +157,7 @@ def collect_unique_ips(
     col_unit: Optional[str],
     limit: Optional[int],
     max_expand: int = DEFAULT_MAX_EXPAND,
+    expand_all: bool = False,
 ) -> Tuple[List[dict], Set[str]]:
     processed: List[dict] = []
     unique_ips: Set[str] = set()
@@ -169,17 +177,26 @@ def collect_unique_ips(
             continue
 
         try:
-            ips, truncated = expand_range(start_ip, end_ip, max_expand)
+            ips, oversized = expand_range(
+                start_ip, end_ip, max_expand, expand_all=expand_all
+            )
         except ValueError as exc:
             print("[WARN] row %d: %s" % (idx + 2, exc), file=sys.stderr)
             continue
 
-        if truncated:
-            print(
-                "[WARN] row %d: range > %d, only start/end kept: %s - %s"
-                % (idx + 2, max_expand, start_ip, end_ip),
-                file=sys.stderr,
-            )
+        if oversized:
+            if expand_all:
+                print(
+                    "[INFO] row %d: range > %d, fully expanded: %s - %s"
+                    % (idx + 2, max_expand, start_ip, end_ip),
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "[WARN] row %d: range > %d, only start/end kept: %s - %s"
+                    % (idx + 2, max_expand, start_ip, end_ip),
+                    file=sys.stderr,
+                )
 
         item: Dict = {
             col_start: start_ip,
@@ -348,6 +365,7 @@ def process_file(
     timeout_sec: float,
     limit: Optional[int],
     max_expand: int,
+    expand_all: bool = False,
     skip_ping: bool = False,
     dedup_ip: bool = False,
 ) -> Tuple[int, Dict[str, str]]:
@@ -376,7 +394,7 @@ def process_file(
 
     print("  rows: %d (max_expand=%d)" % (len(rows), max_expand))
     processed, unique_ips = collect_unique_ips(
-        rows, col_start, col_end, col_unit, limit, max_expand
+        rows, col_start, col_end, col_unit, limit, max_expand, expand_all
     )
     expanded_total = count_expanded_ips(processed)
     print(
@@ -480,11 +498,21 @@ def main() -> int:
         help="Max addresses to enumerate per segment (default 256)",
     )
     parser.add_argument(
+        "--expand-all",
+        action="store_true",
+        help=(
+            "Fully enumerate ranges larger than --max-expand instead of "
+            "keeping only their start/end addresses"
+        ),
+    )
+    parser.add_argument(
         "--dedup-ip",
         action="store_true",
         help="After expand, output one row per unique IP (drop duplicate rows)",
     )
     args = parser.parse_args()
+    if args.max_expand < 1:
+        parser.error("--max-expand must be >= 1")
 
     base_dir = Path(__file__).resolve().parent
     raw_input = Path(args.data_dir)
@@ -535,6 +563,7 @@ def main() -> int:
             timeout_sec=args.timeout,
             limit=args.limit,
             max_expand=args.max_expand,
+            expand_all=args.expand_all,
             skip_ping=args.skip_ping,
             dedup_ip=args.dedup_ip,
         )

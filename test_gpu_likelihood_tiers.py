@@ -61,6 +61,35 @@ cases = [
         )},
     ), "中", "LLM服务"),
     (classify(
+        "确认",
+        tool="ollama",
+        probes={"/api/tags": ProbeResult(
+            status=200,
+            body='{"models":[{"name":"qwen2.5:7b","details":{"parameter_size":"7B"}},{"name":"nomic-embed-text:latest","details":{"parameter_size":"137M"}}]}',
+        )},
+    ), "低", "LLM服务"),
+    (classify(
+        "确认",
+        tool="ollama",
+        probes={"/api/tags": ProbeResult(
+            status=200,
+            body='{"models":[{"name":"qwen2.5:14b","details":{"parameter_size":"14B"}},{"name":"bge-reranker-v2","details":{"parameter_size":"568M"}}]}',
+        )},
+    ), "中", "LLM服务"),
+    (classify(
+        "确认",
+        probes={"/v1/models": ProbeResult(
+            status=200,
+            body='{"data":[{"id":"gpt-4o","owned_by":"openai"}]}',
+        )},
+    ), "低", "LLM服务"),
+    (classify(
+        "确认",
+        probes={"/v1/models": ProbeResult(
+            status=200,
+            body='{"data":[{"id":"custom-model","owned_by":"unclassified"}]}',
+        )},
+    ), "中", "LLM服务"),    (classify(
         "否",
         probes={"/metrics": ProbeResult(
             status=200, body="process_cpu_seconds_total 12"
@@ -98,7 +127,7 @@ async def validate_probe_paths():
             probes={"/": ProbeResult(status=200, body="ok")},
         )
         await phase_gpu_probe([state], 2, cfg)
-        assert calls == ["/metrics", "/api/ps"], calls
+        assert calls == [*scan_llm.GPU_METRIC_PATHS, "/api/ps"], calls
         assert state.probes["/metrics"].status == 200
         assert state.probes["/api/ps"].status == 200
     finally:

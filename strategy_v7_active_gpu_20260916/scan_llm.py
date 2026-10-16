@@ -72,11 +72,11 @@ GPU_OPENAPI_DOC_PATHS = (
     "/api/openapi.json", "/v1/openapi.json",
 )
 GPU_OPENAPI_MAX_DOC_PROBES = 3
-GPU_OPENAPI_MAX_HARDWARE_PROBES = 3
+GPU_OPENAPI_MAX_HARDWARE_PROBES = 5
 GPU_OPENAPI_TIMEOUT = 5
 GPU_OPENAPI_PATH_KEYWORDS = (
-    "gpu", "device", "worker", "cluster", "resource",
-    "hardware", "accelerator", "node",
+    "gpu", "device", "worker", "cluster", "resource", "hardware",
+    "accelerator", "node", "memory", "vram", "nvidia", "cuda", "nvml",
 )
 GPU_OPENAPI_PATH_DENY = (
     "start", "stop", "launch", "terminate", "delete", "remove",
@@ -87,8 +87,9 @@ GPU_OPENAPI_PATH_DENY = (
 )
 GPU_OPENAPI_PATH_READ_ONLY = (
     "gpu", "device", "worker", "cluster", "resource", "hardware",
-    "accelerator", "node", "info", "status", "list", "inventory",
-    "metric", "health", "summary", "detail",
+    "accelerator", "node", "memory", "vram", "nvidia", "cuda", "nvml",
+    "info", "status", "list", "inventory", "metric", "health", "summary",
+    "detail", "usage", "capacity", "telemetry",
 )
 
 OUTPUT_FIELDNAMES = [
@@ -1354,6 +1355,13 @@ def _openapi_gpu_candidate(state: TargetState) -> bool:
 
 
 def _openapi_hardware_paths(body: str) -> List[str]:
+    """Select a small, read-only set of OpenAPI-declared hardware endpoints.
+
+    Selection is driven by the published specification rather than a fixed
+    vendor route list.  Path, operation metadata and response schema are used
+    only to identify likely hardware information; requests remain no-body GETs
+    and state-changing paths are rejected by name.
+    """
     try:
         spec = json.loads(body)
     except (json.JSONDecodeError, TypeError):
@@ -1361,40 +1369,72 @@ def _openapi_hardware_paths(body: str) -> List[str]:
     paths = spec.get("paths") if isinstance(spec, dict) else None
     if not isinstance(paths, dict):
         return []
-    selected: List[str] = []
+
+    selected: List[Tuple[int, str]] = []
+    direct_markers = (
+        "gpu-memory", "gpu_memory", "vram", "nvidia", "cuda", "nvml",
+        "memory-info", "memory_info", "memory-usage", "memory_usage",
+    )
     for path, operations in paths.items():
         if not isinstance(path, str) or not path.startswith("/") or "{" in path:
             continue
-        low = path.lower()
-        npu_read_path = bool(re.fullmatch(
-            r"/(?:api/|v\d+/)*(?:npu|ascend)(?:/(?:info|status|devices|inventory|metrics))?", low))
-        if not npu_read_path and not any(keyword in low for keyword in GPU_OPENAPI_PATH_KEYWORDS):
-            continue
-        if any(keyword in low for keyword in GPU_OPENAPI_PATH_DENY):
-            continue
-        if not npu_read_path and not any(keyword in low for keyword in GPU_OPENAPI_PATH_READ_ONLY):
+        low_path = path.lower()
+        if any(keyword in low_path for keyword in GPU_OPENAPI_PATH_DENY):
             continue
         if not isinstance(operations, dict):
             continue
         get_operation = (
-            operations.get("get")
-            if "get" in operations
-            else operations.get("GET")
+            operations.get("get") if "get" in operations else operations.get("GET")
         )
-        if not isinstance(get_operation, dict):
+        if not isinstance(get_operation, dict) or "requestBody" in get_operation:
             continue
-        if "requestBody" in get_operation:
-            continue
+
         parameters = list(operations.get("parameters") or [])
         parameters.extend(get_operation.get("parameters") or [])
         if any(
             isinstance(parameter, dict)
-            and str(parameter.get("in") or "").lower() == "body"
+            and (
+                str(parameter.get("in") or "").lower() == "body"
+                or (
+                    bool(parameter.get("required"))
+                    and str(parameter.get("in") or "").lower()
+                    in {"query", "header", "cookie"}
+                )
+            )
             for parameter in parameters
         ):
             continue
-        selected.append(path)
-    return sorted(set(selected), key=lambda value: (len(value), value))[:GPU_OPENAPI_MAX_HARDWARE_PROBES]
+
+        # Operation summaries, tags and response schemas often document a GPU
+        # endpoint whose URL itself is generic (for example /api/status).
+        operation_text = json.dumps(get_operation, ensure_ascii=False).lower()
+        candidate_text = low_path + " " + operation_text
+        npu_read_path = bool(re.fullmatch(
+            r"/(?:api/|v\d+/)*(?:npu|ascend)(?:/(?:info|status|devices|inventory|metrics))?",
+            low_path,
+        ))
+        hardware_signal = any(
+            keyword in candidate_text for keyword in GPU_OPENAPI_PATH_KEYWORDS
+        )
+        read_signal = any(
+            keyword in candidate_text for keyword in GPU_OPENAPI_PATH_READ_ONLY
+        )
+        if not npu_read_path and not (hardware_signal and read_signal):
+            continue
+
+        if any(marker in candidate_text for marker in direct_markers):
+            priority = 0
+        elif any(marker in candidate_text for marker in (
+            "gpu", "accelerator", "device", "hardware", "inventory",
+        )):
+            priority = 1
+        else:
+            priority = 2
+        selected.append((priority, path))
+
+    return [
+        path for _, path in sorted(set(selected), key=lambda item: (item[0], len(item[1]), item[1]))
+    ][:GPU_OPENAPI_MAX_HARDWARE_PROBES]
 
 
 async def _gpu_openapi_single(

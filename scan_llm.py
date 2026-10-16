@@ -59,6 +59,10 @@ TLS_REQUIRED_MARKERS = (
 BODY_LIMIT = 1024 * 256   # bytes read per response
 EVIDENCE_BODY_MAX = 1000  # chars kept per evidence snippet
 EVIDENCE_SEP = "|||"
+GPU_METRIC_PATHS = (
+    "/metrics", "/metrics/", "/prometheus", "/actuator/prometheus",
+)
+GPU_PROBE_PORTS = {"8002", "9400", "9401", "9835"}
 
 OUTPUT_FIELDNAMES = [
     "ip", "port", "protocol", "is_llm",
@@ -1230,14 +1234,18 @@ def _gpu_hits(state: TargetState, cfg: ScanConfig) -> List[str]:
 
 
 def _metric_hits(state: TargetState, keywords: List[str]) -> List[str]:
-    pr = state.probes.get("/metrics")
-    if not pr or pr.status != 200 or not pr.body:
-        return []
-    low = pr.body.lower()
     hits: List[str] = []
-    for kw in keywords:
-        if kw.lower() in low:
-            hits.append("/metrics:%s" % kw)
+    seen_keywords = set()
+    for path in GPU_METRIC_PATHS:
+        pr = state.probes.get(path)
+        if not pr or pr.status != 200 or not pr.body:
+            continue
+        low = pr.body.lower()
+        for kw in keywords:
+            normalized = kw.lower()
+            if normalized in low and normalized not in seen_keywords:
+                seen_keywords.add(normalized)
+                hits.append("%s:%s" % (path, kw))
     return hits[:5]
 
 
@@ -1262,6 +1270,57 @@ def _ollama_vram_hits(state: TargetState) -> List[str]:
     return hits[:5]
 
 
+def _vllm_gpu_allocation_hits(state: TargetState) -> List[str]:
+    """Return direct GPU evidence from an active vLLM KV-cache allocation."""
+    hits: List[str] = []
+    for path in GPU_METRIC_PATHS:
+        pr = state.probes.get(path)
+        if not pr or pr.status != 200 or not pr.body:
+            continue
+        for labels in re.findall(r"^vllm:cache_config_info\{([^}]*)\}\s+\S+", pr.body, re.MULTILINE):
+            values = dict(re.findall(r"(\w+)=\"([^\"]*)\"", labels))
+            try:
+                gpu_blocks = int(values.get("num_gpu_blocks") or 0)
+                gpu_memory = float(values.get("gpu_memory_utilization") or 0)
+            except ValueError:
+                continue
+            if gpu_blocks > 0 and gpu_memory > 0:
+                hits.append(
+                    "%s:vllm_gpu_blocks=%d gpu_memory_utilization=%s"
+                    % (path, gpu_blocks, values["gpu_memory_utilization"])
+                )
+    return _dedupe_keep_last(hits)[:5]
+
+
+def _model_accelerator_hits(state: TargetState) -> List[str]:
+    """Return medium-strength accelerator assignments from /v1/models."""
+    pr = state.probes.get("/v1/models")
+    if not pr or pr.status != 200:
+        return []
+    data = _json_dict(pr.body)
+    items = data.get("data") if data else None
+    if not isinstance(items, list):
+        return []
+    hits: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        accelerators = item.get("accelerators")
+        if accelerators in (None, "", []):
+            continue
+        if isinstance(accelerators, list):
+            values = [str(value) for value in accelerators if str(value)]
+        else:
+            values = [str(accelerators)]
+        if not values:
+            continue
+        model = str(item.get("id") or item.get("model_name") or "model")
+        hits.append(
+            "/v1/models:accelerators=%s model=%s"
+            % (",".join(values[:8]), model)
+        )
+    return hits[:5]
+
 def _gpu_evidence_tiers(
     state: TargetState, cfg: ScanConfig
 ) -> Tuple[List[str], List[str]]:
@@ -1270,10 +1329,146 @@ def _gpu_evidence_tiers(
         state, _as_list(ai_cfg.get("gpu_direct_keywords"))
     )
     direct.extend(_ollama_vram_hits(state))
+    direct.extend(_vllm_gpu_allocation_hits(state))
     inference = _metric_hits(
         state, _as_list(ai_cfg.get("gpu_inference_keywords"))
     )
+    inference.extend(_model_accelerator_hits(state))
     return _dedupe_keep_last(direct)[:5], _dedupe_keep_last(inference)[:5]
+
+@dataclass(frozen=True)
+class ModelProfile:
+    """A model-level input to the no-metric GPU likelihood fallback."""
+
+    name: str
+    origin: str  # local / cloud / unknown
+    kind: str  # generative / embedding / reranker / ocr / vision / multimodal / unknown
+    parameter_b: Optional[float]
+
+
+_CLOUD_OWNER_MARKERS = (
+    "openai", "anthropic", "google", "gemini", "azure", "volcengine",
+    "doubao", "dashscope", "alibaba", "qianfan", "baidu", "zhipu",
+    "minimax", "moonshot", "tencent", "hunyuan",
+)
+_EMBEDDING_MODEL_MARKERS = (
+    "embedding", "embed", "e5", "bge", "m3e", "gte", "text2vec",
+    "jina-embeddings", "nomic-embed",
+)
+_RERANKER_MODEL_MARKERS = (
+    "reranker", "rerank", "cross-encoder", "cross_encoder", "colbert",
+)
+
+
+def _parse_parameter_billions(value: Any) -> Optional[float]:
+    """Parse model sizes such as ``7B`` or ``558.84M`` into billions."""
+    if value is None:
+        return None
+    match = re.search(r"(?<![a-z0-9])(\d+(?:\.\d+)?)\s*([bm])\b", str(value).lower())
+    if not match:
+        return None
+    amount = float(match.group(1))
+    return amount if match.group(2) == "b" else amount / 1000.0
+
+
+def _model_kind(name: str) -> str:
+    low = name.lower()
+    if any(marker in low for marker in _EMBEDDING_MODEL_MARKERS):
+        return "embedding"
+    if any(marker in low for marker in _RERANKER_MODEL_MARKERS):
+        return "reranker"
+    if "ocr" in low:
+        return "ocr"
+    if any(marker in low for marker in ("yolo", "vision", "visual", "detection", "segmentation")):
+        return "vision"
+    if any(marker in low for marker in ("multimodal", "qwen-vl", "vision-language", "vl-")):
+        return "multimodal"
+    return "generative" if name else "unknown"
+
+
+def _is_explicit_cloud_owner(owner: Any) -> bool:
+    low = str(owner or "").lower()
+    return bool(low) and any(marker in low for marker in _CLOUD_OWNER_MARKERS)
+
+
+def _local_model_profiles(
+    state: TargetState, framework_signal: str
+) -> List[ModelProfile]:
+    """Extract local/cloud/unknown model profiles from model APIs."""
+    profiles: Dict[str, ModelProfile] = {}
+
+    def add(name: Any, origin: str, parameter_size: Any = None) -> None:
+        name_s = str(name or "").strip()
+        if not name_s:
+            return
+        key = name_s.lower()
+        parameter_b = _parse_parameter_billions(parameter_size)
+        if parameter_b is None:
+            parameter_b = _parse_parameter_billions(name_s)
+        incoming = ModelProfile(name_s, origin, _model_kind(name_s), parameter_b)
+        existing = profiles.get(key)
+        if existing is None:
+            profiles[key] = incoming
+            return
+        preferred_origin = "local" if "local" in {existing.origin, origin} else existing.origin
+        profiles[key] = ModelProfile(
+            existing.name,
+            preferred_origin,
+            existing.kind if existing.kind != "unknown" else incoming.kind,
+            existing.parameter_b if existing.parameter_b is not None else incoming.parameter_b,
+        )
+
+    tags = state.probes.get("/api/tags")
+    tags_data = _json_dict(tags.body) if tags and tags.status == 200 else None
+    for item in (tags_data or {}).get("models") or []:
+        if isinstance(item, dict):
+            details = item.get("details") if isinstance(item.get("details"), dict) else {}
+            add(item.get("name") or item.get("model"), "local", details.get("parameter_size"))
+
+    for path in ("/v1/models", "/api/v1/models", "/openai/v1/models", "/v2/models"):
+        probe = state.probes.get(path)
+        data = _json_dict(probe.body) if probe and probe.status == 200 else None
+        for item in (data or {}).get("data") or []:
+            if not isinstance(item, dict):
+                continue
+            owner = item.get("owned_by")
+            origin = "local" if framework_signal else "cloud" if _is_explicit_cloud_owner(owner) else "unknown"
+            add(item.get("id") or item.get("model_name") or item.get("name"), origin,
+                item.get("parameter_size") or item.get("parameters"))
+    return list(profiles.values())
+
+
+def _model_candidate_decision(
+    state: TargetState, framework_signal: str
+) -> Optional[Tuple[bool, str]]:
+    """Return whether model evidence retains medium likelihood without metrics."""
+    profiles = _local_model_profiles(state, framework_signal)
+    if not profiles:
+        return None
+    unknown = [profile for profile in profiles if profile.origin == "unknown"]
+    if unknown:
+        names = ", ".join(profile.name for profile in unknown[:4])
+        return True, "模型来源或规模无法确认，保留中等候选：%s" % names
+
+    local = [profile for profile in profiles if profile.origin == "local"]
+    if not local:
+        return False, "模型均为明确cloud来源，已从本地GPU候选中排除"
+
+    retained: List[ModelProfile] = []
+    excluded: List[str] = []
+    for profile in local:
+        if profile.kind in {"embedding", "reranker"}:
+            excluded.append("%s(%s)" % (profile.name, profile.kind))
+        elif profile.kind == "generative" and profile.parameter_b is not None and profile.parameter_b < 10:
+            excluded.append("%s(%.3gB<10B)" % (profile.name, profile.parameter_b))
+        else:
+            retained.append(profile)
+
+    if retained:
+        names = ", ".join(profile.name for profile in retained[:4])
+        suffix = ("；已排除 " + ", ".join(excluded[:4])) if excluded else ""
+        return True, "保留本地GPU候选：%s%s" % (names, suffix)
+    return False, "本地模型均已排除：%s" % ", ".join(excluded[:6])
 
 
 def _set_gpu_classification(
@@ -1285,22 +1480,29 @@ def _set_gpu_classification(
     inference_hits: List[str],
     framework_signal: str = "",
 ) -> None:
-    """Apply tiers: device/VRAM=high, inference/framework=medium, AI-only=low."""
+    """Apply tiers: device/VRAM=high, inference=medium, then model fallback."""
     if direct_gpu_hits:
         state.gpu_likelihood = "高"
         state.gpu_evidence = "; ".join(direct_gpu_hits)
     elif inference_hits:
         state.gpu_likelihood = "中"
         state.gpu_evidence = "; ".join(inference_hits)
-    elif ai_service and (gpu_hits or framework_signal):
-        state.gpu_likelihood = "中"
-        evidence = list(gpu_hits)
-        if framework_signal:
-            evidence.append("framework=%s" % framework_signal)
-        state.gpu_evidence = "; ".join(_dedupe_keep_last(evidence))
     elif ai_service:
-        state.gpu_likelihood = "低"
-        state.gpu_evidence = "仅检测到AI/LLM服务，未发现当前端口的GPU证据"
+        model_decision = _model_candidate_decision(state, framework_signal)
+        if model_decision is not None and not model_decision[0]:
+            state.gpu_likelihood = "低"
+            state.gpu_evidence = model_decision[1]
+        elif gpu_hits or framework_signal or model_decision is not None:
+            state.gpu_likelihood = "中"
+            evidence = list(gpu_hits)
+            if framework_signal:
+                evidence.append("framework=%s" % framework_signal)
+            if model_decision is not None:
+                evidence.append(model_decision[1])
+            state.gpu_evidence = "; ".join(_dedupe_keep_last(evidence))
+        else:
+            state.gpu_likelihood = "低"
+            state.gpu_evidence = "仅检测到AI/LLM服务，未发现当前端口的GPU证据"
     else:
         state.gpu_likelihood = "未知"
         state.gpu_evidence = ""
@@ -1415,7 +1617,13 @@ def _analysis_text(state: TargetState) -> str:
                 % state.gpu_evidence.replace(";", "、")
             )
     elif state.gpu_likelihood == "低":
-        parts.append("未发现当前端口GPU设备或推理指标，GPU算力可能性低")
+        if state.gpu_evidence:
+            parts.append(
+                "当前端口未发现GPU设备或推理指标，%s，GPU算力可能性低"
+                % state.gpu_evidence.replace(";", "、")
+            )
+        else:
+            parts.append("未发现当前端口GPU设备或推理指标，GPU算力可能性低")
     return "；".join(parts) + ("。" if parts else "")
 
 
@@ -1460,6 +1668,33 @@ def _gpu_business_signal(state: TargetState, cfg: ScanConfig) -> str:
     return _first_keyword_hit(
         _probe_text(state), _as_list(ai_cfg.get("gpu_business_keywords"))
     )
+
+
+def _inferred_framework_signal(state: TargetState) -> str:
+    root = state.probes.get("/")
+    if root and root.status > 0 and "ollama is running" in root.body.lower():
+        return "ollama"
+    if root and root.status > 0 and "xinference" in root.body.lower():
+        return "xinference"
+
+    tags = state.probes.get("/api/tags")
+    tags_data = _json_dict(tags.body) if tags and tags.status == 200 else None
+    if tags_data is not None and isinstance(tags_data.get("models"), list):
+        return "ollama"
+
+    models = state.probes.get("/v1/models")
+    models_data = _json_dict(models.body) if models and models.status == 200 else None
+    items = models_data.get("data") if models_data else None
+    if isinstance(items, list):
+        owners = {
+            str(item.get("owned_by") or "").lower()
+            for item in items
+            if isinstance(item, dict)
+        }
+        for framework in ("vllm", "sglang", "xinference", "ollama", "tgi"):
+            if any(framework in owner for owner in owners):
+                return framework
+    return ""
 
 
 def _apply_service_classification(state: TargetState, cfg: ScanConfig) -> None:
@@ -1511,8 +1746,13 @@ def _apply_service_classification(state: TargetState, cfg: ScanConfig) -> None:
             "ollama", "llama.cpp", "localai", "fastchat",
         }
         framework_signal = (
-            state.deploy_tool if state.deploy_tool in gpu_frameworks else ""
+            state.deploy_tool if state.deploy_tool in gpu_frameworks
+            else _inferred_framework_signal(state)
         )
+        if framework_signal and state.deploy_tool in {
+            "", "unknown", "未知-OpenAI兼容"
+        }:
+            state.deploy_tool = framework_signal
         _set_gpu_classification(
             state,
             ai_service=True,
@@ -1883,6 +2123,18 @@ def append_checkpoint(path: Path, states: List[TargetState]) -> None:
             f.write(json.dumps({"ip": s.ip, "port": s.port}, ensure_ascii=False) + "\n")
 
 
+def _strip_surrogates(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.encode("utf-8", "surrogatepass").decode("utf-8", "ignore")
+    return value
+
+
+def _sanitize_csv_rows(rows: List[dict]) -> List[dict]:
+    return [
+        {key: _strip_surrogates(value) for key, value in row.items()}
+        for row in rows
+    ]
+
 def write_csv_rows(path: Path, rows: List[dict], append: bool = False) -> None:
     mode = "a" if append else "w"
     need_header = not append or not path.is_file() or path.stat().st_size == 0
@@ -1892,7 +2144,7 @@ def write_csv_rows(path: Path, rows: List[dict], append: bool = False) -> None:
         )
         if need_header:
             writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(_sanitize_csv_rows(rows))
 
 
 
@@ -1990,9 +2242,58 @@ def write_csv_atomic(path: Path, fieldnames: List[str], rows: List[dict]) -> Non
             extrasaction="ignore",
         )
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(_sanitize_csv_rows(rows))
     temp.replace(path)
 
+
+def _has_direct_gpu_evidence(value: str) -> bool:
+    lower = (value or "").lower()
+    return any(token in lower for token in (
+        "size_vram=", "dcgm_", "dcgm_fi_dev_", "nvidia-smi",
+        "gpu_uuid", "gpu_device", "gpu_memory", "gpu_utilization",
+        "nv_gpu_", "tritonserver_gpu", "rocm_smi", "amd_smi", "amdgpu",
+    ))
+
+
+def apply_same_ip_gpu_correlation(rows: List[dict]) -> int:
+    """Propagate direct GPU evidence to confirmed LLM ports on the same IP."""
+    sources_by_ip: Dict[str, List[dict]] = {}
+    for row in rows:
+        evidence = (row.get("gpu_evidence") or "").strip()
+        if row.get("gpu_likelihood") != "高" or not _has_direct_gpu_evidence(evidence):
+            continue
+        sources_by_ip.setdefault((row.get("ip") or "").strip(), []).append(row)
+
+    changed = 0
+    for row in rows:
+        if row.get("is_llm") != "确认" or row.get("gpu_likelihood") == "高":
+            continue
+        ip = (row.get("ip") or "").strip()
+        target_port = str(row.get("port") or "").strip()
+        sources = [
+            source for source in sources_by_ip.get(ip, [])
+            if str(source.get("port") or "").strip() != target_port
+        ]
+        if not sources:
+            continue
+        source_ports = []
+        source_evidence = []
+        for source in sources:
+            port = str(source.get("port") or "").strip()
+            if port and port not in source_ports:
+                source_ports.append(port)
+            evidence = (source.get("gpu_evidence") or "").strip()
+            if evidence and evidence not in source_evidence:
+                source_evidence.append(evidence)
+        row["gpu_likelihood"] = "高"
+        row["gpu_evidence"] = (
+            "same_ip_gpu_port=%s; %s"
+            % (",".join(source_ports[:5]), "; ".join(source_evidence[:5]))
+        ).strip("; ")
+        state = _row_to_state(row)
+        row["分析"] = _analysis_text(state)
+        changed += 1
+    return changed
 
 async def run_gpu_rescan(
     input_path: Path,
@@ -2049,6 +2350,8 @@ async def run_gpu_rescan(
     for row in original_rows:
         key = "%s:%s" % (row.get("ip"), row.get("port"))
         final_rows.append(updates.get(key, row))
+    correlated = apply_same_ip_gpu_correlation(final_rows)
+    print("Same-IP GPU correlation: %d confirmed LLM ports promoted" % correlated)
     final_llm = {
         label: sum(1 for row in final_rows if row.get("is_llm") == label)
         for label in ("确认", "疑似")
@@ -2118,11 +2421,19 @@ async def run_pipeline(
             print("Phase 1: LLM fingerprint (%d targets, concurrency=%d)..." % (len(http_alive), p1_c))
             http_alive = await phase1_fingerprint(http_alive, p1_c, cfg)
 
-        # Independent GPU probe runs for every live HTTP/HTTPS target.
-        if http_alive:
-            print("GPU probe: /metrics + /api/ps (%d targets, concurrency=%d)..."
-                  % (len(http_alive), gpu_c))
-            http_alive = await phase_gpu_probe(http_alive, gpu_c, cfg)
+        # Deep GPU probes are limited to AI candidates and common metrics ports.
+        gpu_targets = [
+            state for state in http_alive
+            if state.is_llm in {"确认", "疑似"}
+            or state.port in GPU_PROBE_PORTS
+        ]
+        if gpu_targets:
+            probe_paths = _as_list((cfg.ai_service or {}).get("gpu_probe_paths"))
+            print(
+                "GPU probe: %d paths x %d selected targets (concurrency=%d)..."
+                % (len(probe_paths), len(gpu_targets), gpu_c)
+            )
+            await phase_gpu_probe(gpu_targets, gpu_c, cfg)
 
         confirmed = [s for s in http_alive if s.is_llm == "确认"]
         suspect = [s for s in http_alive if s.is_llm == "疑似"]
@@ -2187,6 +2498,16 @@ async def run_pipeline(
             len(rows), llm_count, suspect_count, ai_model_count,
             ai_frontend_count, gpu_compute_count, gpu_high_count
         ))
+
+    # Apply same-IP evidence after all batches so GPU metrics and LLM ports can
+    # be correlated even when they were processed in different batches.
+    if output_path.is_file():
+        fieldnames, final_rows = read_csv_rows_preserve(output_path)
+        correlated = apply_same_ip_gpu_correlation(final_rows)
+        if correlated:
+            write_csv_atomic(output_path, fieldnames, final_rows)
+        all_result_rows = final_rows
+        print("Same-IP GPU correlation: %d confirmed LLM ports promoted" % correlated)
 
     # Summary
     total_written = len(all_result_rows)
@@ -2324,3 +2645,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

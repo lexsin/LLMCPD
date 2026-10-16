@@ -1,0 +1,16 @@
+; Copy outside this strategy directory, fill values, then set FULL_PORT_EXECUTOR=remote.
+; Do not commit the filled file or private key.
+[ssh]
+host = 10.10.3.44
+user = scanner
+port = 22
+identity_file = /home/lixiao/.ssh/id_ed25519_full_port
+known_hosts_file = /home/lixiao/.ssh/known_hosts
+connect_timeout = 10
+transport_retries = 3
+poll_interval = 5
+
+[remote]
+remote_base_dir = /var/tmp/llm-full-port-jobs
+python_bin = python3
+nmap_bin = nmap

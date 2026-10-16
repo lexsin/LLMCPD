@@ -3,11 +3,34 @@ set -Eeuo pipefail
 ROOT=/home/lixiao/llm-detect/TEST
 ISO="$ROOT/strategy_v7_active_gpu_20260916"
 RUN_ID="${RUN_ID:-rescan_all_isolated_v7_active_gpu_20260916}"
-EXPECTED_LOCATIONS="${EXPECTED_LOCATIONS:-40}"
+SOURCE_TABLE="${SOURCE_TABLE:-source_ip_ranges}"
+case "$SOURCE_TABLE" in
+  source_ip_ranges)
+    SOURCE_EXPORTER="${SOURCE_EXPORTER:-$ISO/ip_source_db.py}"
+    DEFAULT_EXPECTED_LOCATIONS=40
+    ;;
+  source_ip_ranges_batch2)
+    SOURCE_EXPORTER="${SOURCE_EXPORTER:-$ISO/ip_source_db_batch2.py}"
+    DEFAULT_EXPECTED_LOCATIONS=47
+    ;;
+  *)
+    echo "SOURCE_TABLE仅支持source_ip_ranges或source_ip_ranges_batch2: $SOURCE_TABLE" >&2
+    exit 1
+    ;;
+esac
+EXPECTED_LOCATIONS="${EXPECTED_LOCATIONS:-$DEFAULT_EXPECTED_LOCATIONS}"
 RUN_DIR="$ROOT/data/$RUN_ID"
 LOG_DIR="$ROOT/logs/$RUN_ID"
 STATUS_FILE="$LOG_DIR/status.txt"
 MASTER_LOG="$LOG_DIR/master.log"
+if [ "$SOURCE_TABLE" = "source_ip_ranges_batch2" ]; then
+  DEFAULT_OVERALL_NAME="第二批基础IP扫描_整批汇总.xlsx"
+else
+  DEFAULT_OVERALL_NAME="第一批基础IP扫描_整批汇总.xlsx"
+fi
+OVERALL_REPORT="${OVERALL_REPORT:-$RUN_DIR/$DEFAULT_OVERALL_NAME}"
+REPORTED_DATABASE="${REPORTED_DATABASE:-$ROOT/data/llm_detect.sqlite3}"
+REPORTED_TABLE="${REPORTED_TABLE:-第二批上报算力}"
 LOCK_FILE="$RUN_DIR/runner.lock"
 FULL_PORT_SCAN="${FULL_PORT_SCAN:-1}"
 FULL_PORT_MODE="${FULL_PORT_MODE:-candidates}"
@@ -27,6 +50,8 @@ ACTIVE_GPU_POLL_INTERVAL="${ACTIVE_GPU_POLL_INTERVAL:-0.5}"
 ACTIVE_GPU_METRICS_INTERVAL="${ACTIVE_GPU_METRICS_INTERVAL:-2}"
 ACTIVE_GPU_TIMEOUT_OBSERVATION="${ACTIVE_GPU_TIMEOUT_OBSERVATION:-300}"
 ACTIVE_GPU_DELAYED_SAMPLES="${ACTIVE_GPU_DELAYED_SAMPLES:-2,10}"
+PORT_SCAN_WORKERS="${PORT_SCAN_WORKERS:-12}"
+PORT_VERIFY_WORKERS="${PORT_VERIFY_WORKERS:-12}"
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo "已有全量隔离扫描任务运行中: $LOCK_FILE" >&2; exit 1; }
@@ -48,7 +73,7 @@ if [ "$FULL_PORT_SCAN" = "1" ] && [ "$FULL_PORT_EXECUTOR" = "remote" ]; then
 fi
 mapfile -t LOCATIONS < <(
   sqlite3 "$ROOT/data/llm_detect.sqlite3" \
-    "select distinct location from source_ip_ranges order by location"
+    "select distinct location from $SOURCE_TABLE order by location"
 )
 [ "${#LOCATIONS[@]}" -eq "$EXPECTED_LOCATIONS" ] || {
   echo "基础企业数量异常，期望$EXPECTED_LOCATIONS，实际${#LOCATIONS[@]}" >&2
@@ -96,7 +121,7 @@ run_one() {
   rm -f "$stage/FAILED"
   status "phase=export index=$index total=$total current=$location attempt=$attempt"
   if [ ! -s "$input" ]; then
-    python3 "$ISO/ip_source_db.py" export \
+    python3 "$SOURCE_EXPORTER" export \
       --location "$location" --output "$input" || return $?
   fi
   status "phase=expand index=$index total=$total current=$location attempt=$attempt"
@@ -111,7 +136,7 @@ run_one() {
   python3 "$ISO/scan_ports_by_source_type.py" \
     --source "$input" --input "$result" --output "$scan_result" \
     --work-dir "$stage/port_scan_modes" --scanner "$ISO/ip_port_scan.py" \
-    --batch-size 500 --parallel-workers 12 --verify-workers 12 \
+    --batch-size 500 --parallel-workers "$PORT_SCAN_WORKERS" --verify-workers "$PORT_VERIFY_WORKERS" \
     --min-rate 3000 --max-retries 1 --host-timeout 120s || return $?
   status "phase=expand-ports index=$index total=$total current=$location attempt=$attempt ip_rows=$ip_rows mode=$mode"
   if ! python3 "$ISO/expand_scan_ports.py" \
@@ -260,6 +285,26 @@ if [ "${#FAILED[@]}" -gt 0 ]; then
 fi
 complete=$(find "$RUN_DIR" -mindepth 2 -maxdepth 2 -name COMPLETE | wc -l)
 failed=$(find "$RUN_DIR" -mindepth 2 -maxdepth 2 -name FAILED | wc -l)
+# Do not declare the batch complete until its full report has been written.
+if [ "$complete" -ne "${#LOCATIONS[@]}" ] || [ "$failed" -ne 0 ]; then
+  status "phase=scan-incomplete total=${#LOCATIONS[@]} complete=$complete failed=$failed current=none"
+  exit 1
+fi
+status "phase=overall-summary total=${#LOCATIONS[@]} complete=$complete failed=$failed current=none"
+overall_tmp="$OVERALL_REPORT.tmp.xlsx"
+if python3 "$ISO/merge_completed_results_with_low.py" \
+    --root "$RUN_DIR" --output "$overall_tmp" \
+    --database "$REPORTED_DATABASE" --reported-table "$REPORTED_TABLE"; then
+  if [ ! -s "$overall_tmp" ]; then
+    status "phase=overall-summary-failed total=${#LOCATIONS[@]} current=none"
+    exit 1
+  fi
+  mv -f "$overall_tmp" "$OVERALL_REPORT"
+else
+  status "phase=overall-summary-failed total=${#LOCATIONS[@]} current=none"
+  exit 1
+fi
+log "整批总表生成完成: $OVERALL_REPORT"
 status "phase=complete total=${#LOCATIONS[@]} complete=$complete failed=$failed current=none"
 printf 'total=%d\ncomplete=%d\nfailed=%d\nfinished=%s\n' \
   "${#LOCATIONS[@]}" "$complete" "$failed" "$(date '+%F %T')" > "$LOG_DIR/SUMMARY"
