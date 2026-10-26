@@ -96,7 +96,9 @@ service/
 
 ```sql
 -- 抢占任务
-UPDATE probe_task SET status='RUNNING', start_time=NOW(), updater=:worker, update_date=NOW()
+UPDATE probe_task
+SET status='RUNNING', start_time=NOW(), worker_id=:worker,
+    heartbeat_time=NOW(), update_date=NOW()
 WHERE id = (
   SELECT id FROM (
     SELECT id FROM probe_task WHERE status='PENDING' ORDER BY id LIMIT 1

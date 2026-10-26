@@ -27,6 +27,8 @@ class OrchestratorConfig:
     max_concurrent_tasks: int = 1
     worker_id: str = "worker-1"
     reset_running_on_startup: bool = True
+    heartbeat_interval_sec: float = 15.0
+    lease_timeout_sec: int = 90
 
 
 @dataclass
@@ -39,8 +41,11 @@ class Stage1Config:
     nmap_min_rate: str = "5000"
     nmap_max_retries: str = "1"
     nmap_host_timeout: str = "180s"
-    nmap_anomaly_threshold: int = 20  # 0=关闭;>0 时每批扫完对端口数超阈值的 IP 再做 -sV 复核
-    nmap_verify_workers: int = 4      # -sV 复核的并发数(线程池)
+    nmap_anomaly_threshold: int = 80  # 0=关闭;>0 时每批扫完对端口数超阈值的 IP 再做 -sV 复核
+    nmap_verify_workers: int = 8      # -sV 复核的并发数(线程池)
+    nmap_verify_host_timeout: str = "15s"
+    nmap_verify_max_retries: str = "0"
+    nmap_verify_proc_timeout: int = 25
     # ---- 低开放率确认(low-open-confirm,默认关闭)----
     # 一批 IP 扫完后,若开放率低于阈值,认为可能被防火墙整段吞 SYN,
     # 用更慢的参数 + 抽样复扫;命中再扫整批 / 扫扩展端口列表。

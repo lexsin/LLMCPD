@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 try:
     import aiohttp
@@ -41,8 +41,21 @@ EVIDENCE_SEP = "|||"
 OUTPUT_FIELDNAMES = [
     "ip", "port", "protocol", "is_llm",
     "service_type", "model_domain", "gpu_likelihood", "gpu_evidence",
-    "deploy_tool", "deploy_version", "model_info", "evidence", "link", "scan_time",
+    "gpu_probe_detail", "deploy_tool", "deploy_version", "model_info",
+    "evidence", "link", "scan_time",
+    "分析",
 ]
+
+
+def _dedupe_keep_last(values: List[str]) -> List[str]:
+    """Return non-empty values once, ordered by their last occurrence."""
+    seen = set()
+    result_reversed: List[str] = []
+    for value in reversed(values):
+        if value and value not in seen:
+            seen.add(value)
+            result_reversed.append(value)
+    return list(reversed(result_reversed))
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +79,7 @@ class TargetState:
     model_domain: str = ""
     gpu_likelihood: str = ""
     gpu_evidence: str = ""
+    gpu_probe_detail: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     deploy_tool: str = ""
     deploy_version: str = ""
     model_info: str = ""
@@ -73,6 +87,7 @@ class TargetState:
     links: List[str] = field(default_factory=list)
     probes: Dict[str, ProbeResult] = field(default_factory=dict)  # path -> ProbeResult
     scan_time: str = ""
+    analysis: str = ""
 
     def add_evidence(self, method: str, path: str, status: int, body: str) -> None:
         snippet = body[:EVIDENCE_BODY_MAX]
@@ -87,7 +102,7 @@ class TargetState:
         return EVIDENCE_SEP.join(self.evidence)
 
     def link_str(self) -> str:
-        return EVIDENCE_SEP.join(self.links)
+        return EVIDENCE_SEP.join(_dedupe_keep_last(self.links))
 
     def to_row(self) -> dict:
         return {
@@ -99,12 +114,16 @@ class TargetState:
             "model_domain": self.model_domain,
             "gpu_likelihood": self.gpu_likelihood,
             "gpu_evidence": self.gpu_evidence,
+            "gpu_probe_detail": json.dumps(
+                self.gpu_probe_detail, ensure_ascii=False, separators=(",", ":")
+            ) if self.gpu_probe_detail else "",
             "deploy_tool": self.deploy_tool,
             "deploy_version": self.deploy_version,
             "model_info": self.model_info,
             "evidence": self.evidence_str(),
             "link": self.link_str(),
             "scan_time": self.scan_time,
+            "分析": self.analysis,
         }
 
 
@@ -316,6 +335,36 @@ def _phase1_check_suspect(body: str, cfg: ScanConfig) -> bool:
     return False
 
 
+def _match_auth_suspect(
+    path: str, status: int, body: str, auth_cfg: Optional[Dict]
+) -> Optional[str]:
+    """Return an auth keyword after removing reflections of the probe path."""
+    if not auth_cfg or status not in auth_cfg.get("status_codes", []):
+        return None
+
+    bl = body.lower()
+    exclude_pats = auth_cfg.get("exclude_body_patterns", [])
+    if any(str(pattern).lower() in bl for pattern in exclude_pats):
+        return None
+
+    # Gateways often echo the requested path in redirects or error pages.
+    # Remove both literal and percent-encoded forms before matching keywords.
+    sanitized = bl
+    reflected_paths = {
+        path.lower(),
+        quote(path, safe="").lower(),
+    }
+    for reflected_path in reflected_paths:
+        if reflected_path:
+            sanitized = sanitized.replace(reflected_path, "")
+
+    for keyword in auth_cfg.get("body_keywords", []):
+        normalized = str(keyword).lower()
+        if normalized and normalized in sanitized:
+            return normalized
+    return None
+
+
 def _extract_script_srcs(html: str) -> List[str]:
     srcs: List[str] = []
     script_pattern = re.compile(
@@ -478,7 +527,7 @@ async def _phase1_single(
     proto = state.protocol
     ip, port = state.ip, state.port
     rt = cfg.runtime.phase1
-    has_auth_signal = False
+    auth_signal: Optional[Tuple[str, int, str]] = None
 
     async with sem:
         for path in cfg.phase1.probe_paths:
@@ -499,13 +548,11 @@ async def _phase1_single(
 
             if path != "/":
                 # Check for auth-gated LLM signal (401/403 with relevant keywords)
-                auth_cfg = cfg.phase1.auth_suspect
-                if auth_cfg and status in auth_cfg.get("status_codes", []):
-                    bl = body.lower()
-                    exclude_pats = auth_cfg.get("exclude_body_patterns", [])
-                    if not any(ep.lower() in bl for ep in exclude_pats):
-                        if any(kw in bl for kw in auth_cfg.get("body_keywords", [])):
-                            has_auth_signal = True
+                auth_keyword = _match_auth_suspect(
+                    path, status, body, cfg.phase1.auth_suspect
+                )
+                if auth_keyword and auth_signal is None:
+                    auth_signal = (path, status, auth_keyword)
 
                 matched_rule = _phase1_check_confirmed(path, status, body, cfg)
                 if matched_rule is not None:
@@ -541,9 +588,13 @@ async def _phase1_single(
                 state.evidence.append(js_evidence)
 
         # Auth-gated fallback: mark 疑似 only when no stronger signal found
-        if state.is_llm == "否" and has_auth_signal:
+        if state.is_llm == "否" and auth_signal is not None:
+            auth_path, auth_status, auth_keyword = auth_signal
             state.is_llm = "疑似"
-            state.evidence.append("Phase1: auth-gated response (401/403) with LLM keyword")
+            state.evidence.append(
+                "Phase1: auth-gated response GET %s %d with keyword %s"
+                % (auth_path, auth_status, auth_keyword)
+            )
 
     return state
 
@@ -560,6 +611,79 @@ async def phase1_fingerprint(
         tasks = [_phase1_single(sem, session, s, cfg) for s in http_alive]
         states = await asyncio.gather(*tasks)
     return list(states)
+
+
+# ---------------------------------------------------------------------------
+# Independent GPU compute probe — all live HTTP/HTTPS targets
+# ---------------------------------------------------------------------------
+
+async def _gpu_probe_path(
+    sem: asyncio.Semaphore,
+    session: aiohttp.ClientSession,
+    state: TargetState,
+    path: str,
+    cfg: ScanConfig,
+) -> None:
+    existing = state.probes.get(path)
+    if existing and existing.status > 0:
+        state.gpu_probe_detail[path] = {
+            "status": existing.status,
+            "error": existing.error,
+            "attempts": 0,
+            "source": "cache",
+        }
+        return
+
+    rt = cfg.runtime.gpu_probe
+    attempts = 0
+    result = ProbeResult(error="not_attempted")
+    async with sem:
+        for attempt in range(rt.retries + 1):
+            attempts += 1
+            result = await _extra_get(
+                session, state.protocol, state.ip, state.port, path, rt.timeout
+            )
+            retryable = result.status == 0 or result.status >= 500
+            if not retryable or attempt >= rt.retries:
+                break
+            delay_index = min(attempt, len(rt.retry_delays) - 1)
+            delay = rt.retry_delays[delay_index] if rt.retry_delays else 0
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    state.probes[path] = result
+    state.gpu_probe_detail[path] = {
+        "status": result.status,
+        "error": result.error,
+        "attempts": attempts,
+        "source": "network",
+    }
+
+
+async def phase_gpu_probe(
+    http_alive: List[TargetState], concurrency: Optional[int], cfg: ScanConfig
+) -> List[TargetState]:
+    paths = _as_list((cfg.ai_service or {}).get("gpu_probe_paths"))
+    if not paths:
+        paths = ["/metrics", "/api/ps"]
+    # GPU probing intentionally ignores the pipeline-wide concurrency override.
+    gpu_concurrency = cfg.runtime.gpu_probe.concurrency
+    if concurrency is not None and concurrency != gpu_concurrency:
+        gpu_concurrency = cfg.runtime.gpu_probe.concurrency
+    sem = asyncio.Semaphore(gpu_concurrency)
+    connector = aiohttp.TCPConnector(
+        limit=gpu_concurrency, ssl=False,
+        enable_cleanup_closed=True, keepalive_timeout=30,
+    )
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            _gpu_probe_path(sem, session, state, path, cfg)
+            for state in http_alive
+            for path in paths
+        ]
+        if tasks:
+            await asyncio.gather(*tasks)
+    return http_alive
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +752,7 @@ def _probe_text(state: TargetState) -> str:
 
 
 def _gpu_hits(state: TargetState, cfg: ScanConfig) -> List[str]:
+    """Return indirect GPU text/framework hints from all successful probes."""
     ai_cfg = cfg.ai_service or {}
     keywords = (
         _as_list(ai_cfg.get("gpu_keywords"))
@@ -644,6 +769,138 @@ def _gpu_hits(state: TargetState, cfg: ScanConfig) -> List[str]:
                 if item not in hits:
                     hits.append(item)
     return hits[:5]
+
+
+def _metric_hits(state: TargetState, keywords: List[str]) -> List[str]:
+    pr = state.probes.get("/metrics")
+    if not pr or pr.status != 200 or not pr.body:
+        return []
+    low = pr.body.lower()
+    hits: List[str] = []
+    for kw in keywords:
+        if kw.lower() in low:
+            hits.append("/metrics:%s" % kw)
+    return hits[:5]
+
+
+def _ollama_vram_hits(state: TargetState) -> List[str]:
+    pr = state.probes.get("/api/ps")
+    if not pr or pr.status != 200:
+        return []
+    data = _json_dict(pr.body)
+    if not data:
+        return []
+    hits: List[str] = []
+    for model in data.get("models") or []:
+        if not isinstance(model, dict):
+            continue
+        try:
+            size_vram = int(model.get("size_vram") or 0)
+        except (TypeError, ValueError):
+            size_vram = 0
+        if size_vram > 0:
+            name = str(model.get("name") or model.get("model") or "model")
+            hits.append("/api/ps:size_vram=%d model=%s" % (size_vram, name))
+    return hits[:5]
+
+
+def _gpu_evidence_tiers(
+    state: TargetState, cfg: ScanConfig
+) -> Tuple[List[str], List[str]]:
+    ai_cfg = cfg.ai_service or {}
+    direct = _metric_hits(
+        state, _as_list(ai_cfg.get("gpu_direct_keywords"))
+    )
+    direct.extend(_ollama_vram_hits(state))
+    inference = _metric_hits(
+        state, _as_list(ai_cfg.get("gpu_inference_keywords"))
+    )
+    return _dedupe_keep_last(direct)[:5], _dedupe_keep_last(inference)[:5]
+
+
+def _set_gpu_classification(
+    state: TargetState,
+    *,
+    ai_service: bool,
+    gpu_hits: List[str],
+    direct_gpu_hits: List[str],
+    inference_hits: List[str],
+    framework_signal: str = "",
+) -> None:
+    """Apply tiers: device/VRAM=high, inference/framework=medium, AI-only=low."""
+    if direct_gpu_hits:
+        state.gpu_likelihood = "高"
+        state.gpu_evidence = "; ".join(direct_gpu_hits)
+    elif inference_hits:
+        state.gpu_likelihood = "中"
+        state.gpu_evidence = "; ".join(inference_hits)
+    elif ai_service and (gpu_hits or framework_signal):
+        state.gpu_likelihood = "中"
+        evidence = list(gpu_hits)
+        if framework_signal:
+            evidence.append("framework=%s" % framework_signal)
+        state.gpu_evidence = "; ".join(_dedupe_keep_last(evidence))
+    elif ai_service:
+        state.gpu_likelihood = "低"
+        state.gpu_evidence = "仅检测到AI/LLM服务，未发现当前端口的GPU证据"
+    else:
+        state.gpu_likelihood = "未知"
+        state.gpu_evidence = ""
+
+
+def _add_gpu_probe_evidence(state: TargetState, hits: List[str]) -> None:
+    for hit in hits:
+        path = hit.split(":", 1)[0]
+        pr = state.probes.get(path)
+        if not pr or pr.status <= 0:
+            continue
+        prefix = "GET %s " % path
+        if not any(item.startswith(prefix) for item in state.evidence):
+            state.add_evidence("GET", path, pr.status, pr.body)
+
+
+def _llm_analysis_reason(state: TargetState) -> str:
+    if state.is_llm == "否":
+        return ""
+    if state.deploy_tool == "librechat":
+        return "页面标题命中 LibreChat，判为疑似 LLM 前端"
+    if state.deploy_tool == "one-api":
+        return "页面命中 New API/模型 API 网关特征，判为疑似 LLM 前端"
+    if state.deploy_tool == "llm-knowledge-base":
+        return "页面标题命中大模型知识库，判为疑似 LLM 应用"
+    evidence = state.evidence_str()
+    js_match = re.search(r"JS bundle suspect: ([^\s]+) matched=([^|\s]+)", evidence)
+    if js_match:
+        keyword = js_match.group(2).split("+", 1)[0]
+        return "页面脚本命中AI聊天关键词“%s”，判为疑似LLM前端" % keyword
+    if state.is_llm == "确认":
+        if state.deploy_tool and state.deploy_tool not in {"unknown", "未知-OpenAI兼容"}:
+            return "识别到%s模型服务，确认已部署AI模型" % state.deploy_tool
+        return "模型接口返回有效模型信息，确认已部署AI模型"
+    return "响应命中LLM前端或接口特征，判为疑似LLM"
+
+
+def _analysis_text(state: TargetState) -> str:
+    parts: List[str] = []
+    llm_reason = _llm_analysis_reason(state)
+    if llm_reason:
+        parts.append(llm_reason)
+    if state.gpu_likelihood == "高":
+        parts.append(
+            "当前端口%s，确认存在GPU算力"
+            % state.gpu_evidence.replace(";", "、")
+        )
+    elif state.gpu_likelihood == "中":
+        if "业务页面包含GPU租赁/云GPU/BitaHub线索" in state.gpu_evidence:
+            parts.append("页面命中租GPU/BitaHub业务线索，属于 GPU 算力业务平台；未发现设备级指标，GPU 判中")
+        else:
+            parts.append(
+                "当前端口%s，GPU算力可能性中"
+                % state.gpu_evidence.replace(";", "、")
+            )
+    elif state.gpu_likelihood == "低":
+        parts.append("未发现当前端口GPU设备或推理指标，GPU算力可能性低")
+    return "；".join(parts) + ("。" if parts else "")
 
 
 def _model_domain(text: str, cfg: ScanConfig) -> str:
@@ -664,6 +921,31 @@ def _model_domain(text: str, cfg: ScanConfig) -> str:
     return "unknown"
 
 
+def _frontend_signal(state: TargetState, cfg: ScanConfig) -> str:
+    """Return a normalized AI frontend signal from full bodies or JS evidence."""
+    ai_cfg = cfg.ai_service or {}
+    body_hit = _first_keyword_hit(
+        _probe_text(state), _as_list(ai_cfg.get("frontend_keywords"))
+    )
+    if body_hit:
+        return body_hit
+
+    for evidence in state.evidence:
+        if "JS bundle suspect" not in evidence:
+            continue
+        match = re.search(r"\bmatched=([^\s]+)", evidence)
+        return match.group(1) if match else "js-bundle"
+    return ""
+
+
+def _gpu_business_signal(state: TargetState, cfg: ScanConfig) -> str:
+    """Return a GPU business-page signal such as BitaHub/GPU rental."""
+    ai_cfg = cfg.ai_service or {}
+    return _first_keyword_hit(
+        _probe_text(state), _as_list(ai_cfg.get("gpu_business_keywords"))
+    )
+
+
 def _apply_service_classification(state: TargetState, cfg: ScanConfig) -> None:
     model_class, model_status = _root_model_class(state)
     body_text = _probe_text(state)
@@ -674,6 +956,10 @@ def _apply_service_classification(state: TargetState, cfg: ScanConfig) -> None:
         body_text[:2000],
     ])
     gpu_hits = _gpu_hits(state, cfg)
+    direct_gpu_hits, inference_hits = _gpu_evidence_tiers(state, cfg)
+    _add_gpu_probe_evidence(state, direct_gpu_hits + inference_hits)
+    frontend_signal = _frontend_signal(state, cfg)
+    gpu_business_signal = _gpu_business_signal(state, cfg)
 
     if not state.protocol:
         state.service_type = "非HTTP"
@@ -688,46 +974,95 @@ def _apply_service_classification(state: TargetState, cfg: ScanConfig) -> None:
         state.deploy_tool = state.deploy_tool or "AI模型服务"
         state.model_info = state.model_info or model_class
         state.model_domain = _model_domain(model_class, cfg)
-        state.gpu_likelihood = "高" if gpu_hits else (
-            "中" if state.model_domain in {"vision", "ocr"} else "低到中"
+        _set_gpu_classification(
+            state,
+            ai_service=True,
+            gpu_hits=gpu_hits,
+            direct_gpu_hits=direct_gpu_hits,
+            inference_hits=inference_hits,
         )
         evidence = ["model_class=%s" % model_class, "status=%s" % model_status]
-        evidence.extend(gpu_hits)
+        if state.gpu_evidence:
+            evidence.append(state.gpu_evidence)
         state.gpu_evidence = "; ".join(evidence)
         return
 
     if state.is_llm == "确认":
         state.service_type = "LLM服务"
         state.model_domain = _model_domain(combined, cfg)
-        high_tools = {"vllm", "tgi", "sglang", "xinference", "triton", "TensorRT-LLM"}
-        mid_tools = {"ollama", "llama.cpp", "未知-OpenAI兼容", "localai", "fastchat", "litellm", "langserve"}
-        if state.deploy_tool in high_tools or gpu_hits:
-            state.gpu_likelihood = "高"
-        elif state.deploy_tool in mid_tools:
-            state.gpu_likelihood = "中高"
-        else:
-            state.gpu_likelihood = "中高"
-        evidence = list(gpu_hits)
+        gpu_frameworks = {
+            "vllm", "tgi", "sglang", "xinference", "triton", "TensorRT-LLM",
+            "ollama", "llama.cpp", "localai", "fastchat",
+        }
+        framework_signal = (
+            state.deploy_tool if state.deploy_tool in gpu_frameworks else ""
+        )
+        _set_gpu_classification(
+            state,
+            ai_service=True,
+            gpu_hits=gpu_hits,
+            direct_gpu_hits=direct_gpu_hits,
+            inference_hits=inference_hits,
+            framework_signal=framework_signal,
+        )
         if state.deploy_tool == "未知-OpenAI兼容":
-            evidence.append("OpenAI-compatible API; may be proxy")
-        state.gpu_evidence = "; ".join(evidence)
+            suffix = "OpenAI-compatible API; may be proxy"
+            state.gpu_evidence = (
+                "%s; %s" % (state.gpu_evidence, suffix)
+                if state.gpu_evidence else suffix
+            )
         return
 
     if state.is_llm == "疑似":
-        frontend_tools = {"open-webui", "one-api", "gradio", "streamlit"}
-        ai_cfg = cfg.ai_service or {}
-        frontend_hit = _first_keyword_hit(combined, _as_list(ai_cfg.get("frontend_keywords")))
-        if state.deploy_tool in frontend_tools or frontend_hit or any("JS bundle suspect" in e for e in state.evidence):
+        frontend_tools = {
+            "open-webui", "one-api", "gradio", "streamlit",
+            "librechat", "llm-knowledge-base",
+        }
+        if state.deploy_tool in frontend_tools or frontend_signal:
             state.service_type = "AI前端服务"
             state.model_domain = _model_domain(combined, cfg)
-            state.gpu_likelihood = "中" if gpu_hits else "中"
-            state.gpu_evidence = "; ".join(gpu_hits or ([frontend_hit] if frontend_hit else []))
-            return
+        _set_gpu_classification(
+            state,
+            ai_service=True,
+            gpu_hits=gpu_hits,
+            direct_gpu_hits=direct_gpu_hits,
+            inference_hits=inference_hits,
+        )
+        return
 
-    state.service_type = "普通Web"
+    if gpu_business_signal:
+        state.is_llm = "否"
+        state.service_type = "GPU算力服务"
+        state.model_domain = "unknown"
+        if direct_gpu_hits or inference_hits:
+            _set_gpu_classification(
+                state,
+                ai_service=True,
+                gpu_hits=gpu_hits,
+                direct_gpu_hits=direct_gpu_hits,
+                inference_hits=inference_hits,
+            )
+        else:
+            state.gpu_likelihood = "中"
+            state.gpu_evidence = "业务页面包含GPU租赁/云GPU/BitaHub线索"
+        root_probe = state.probes.get("/")
+        if root_probe and root_probe.status > 0:
+            state.add_evidence("GET", "/", root_probe.status, root_probe.body)
+        return
+
     state.model_domain = "unknown"
-    state.gpu_likelihood = "未知"
-    state.gpu_evidence = "; ".join(gpu_hits)
+    _set_gpu_classification(
+        state,
+        ai_service=False,
+        gpu_hits=[],
+        direct_gpu_hits=direct_gpu_hits,
+        inference_hits=inference_hits,
+    )
+    state.service_type = (
+        "GPU算力服务"
+        if state.gpu_likelihood in {"高", "中"}
+        else "普通Web"
+    )
 
 
 def _source_path(source: str) -> str:
@@ -764,6 +1099,9 @@ async def _phase2_single(
 
     async def do_get(path: str) -> Optional[ProbeResult]:
         nonlocal extra_used
+        existing = state.probes.get(path)
+        if existing and existing.status > 0:
+            return existing
         if extra_used >= rt.max_extra_gets:
             return None
         pr = await _extra_get(session, proto, ip, port, path, rt.timeout)
@@ -1041,6 +1379,164 @@ def write_csv_rows(path: Path, rows: List[dict], append: bool = False) -> None:
         writer.writerows(rows)
 
 
+
+def read_csv_rows_preserve(path: Path) -> Tuple[List[str], List[dict]]:
+    for enc in ("utf-8-sig", "gbk", "utf-8"):
+        try:
+            with path.open(encoding=enc, newline="") as source:
+                reader = csv.DictReader(line.replace("\0", "") for line in source)
+                rows = list(reader)
+                return list(reader.fieldnames or []), rows
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("Cannot decode %s" % path)
+
+
+def _parse_probe_detail(value: str) -> Dict[str, Dict[str, Any]]:
+    if not value:
+        return {}
+    try:
+        data = json.loads(value)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _row_to_state(row: dict) -> TargetState:
+    evidence = [
+        item for item in (row.get("evidence") or "").split(EVIDENCE_SEP) if item
+    ]
+    links = [
+        item for item in (row.get("link") or "").split(EVIDENCE_SEP) if item
+    ]
+    return TargetState(
+        ip=(row.get("ip") or "").strip(),
+        port=(row.get("port") or "").strip(),
+        protocol=(row.get("protocol") or "").strip(),
+        is_llm=(row.get("is_llm") or "否").strip(),
+        service_type=(row.get("service_type") or "").strip(),
+        model_domain=(row.get("model_domain") or "").strip(),
+        gpu_likelihood=(row.get("gpu_likelihood") or "").strip(),
+        gpu_evidence=(row.get("gpu_evidence") or "").strip(),
+        gpu_probe_detail=_parse_probe_detail(row.get("gpu_probe_detail") or ""),
+        deploy_tool=(row.get("deploy_tool") or "").strip(),
+        deploy_version=(row.get("deploy_version") or "").strip(),
+        model_info=(row.get("model_info") or "").strip(),
+        evidence=evidence,
+        links=links,
+        scan_time=(row.get("scan_time") or "").strip(),
+        analysis=(row.get("分析") or "").strip(),
+    )
+
+
+def load_gpu_rescan_updates(path: Path) -> Dict[str, dict]:
+    updates: Dict[str, dict] = {}
+    if not path.is_file():
+        return updates
+    with path.open(encoding="utf-8") as source:
+        for line in source:
+            try:
+                obj = json.loads(line)
+                row = obj["row"]
+                updates["%s:%s" % (row["ip"], row["port"])] = row
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+    print("GPU rescan checkpoint: %d completed HTTP targets" % len(updates))
+    return updates
+
+
+def append_gpu_rescan_updates(path: Path, rows: List[dict]) -> None:
+    with path.open("a", encoding="utf-8") as target:
+        for row in rows:
+            target.write(json.dumps({"row": row}, ensure_ascii=False) + "\n")
+        target.flush()
+
+
+def write_csv_atomic(path: Path, fieldnames: List[str], rows: List[dict]) -> None:
+    temp = path.with_suffix(path.suffix + ".tmp")
+    with temp.open("w", encoding="utf-8-sig", newline="") as target:
+        writer = csv.DictWriter(
+            target, fieldnames=fieldnames, quoting=csv.QUOTE_NONNUMERIC,
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    temp.replace(path)
+
+
+async def run_gpu_rescan(
+    input_path: Path,
+    output_path: Path,
+    checkpoint_path: Path,
+    cfg: ScanConfig,
+    batch_size: int,
+    resume: bool,
+) -> None:
+    fieldnames, original_rows = read_csv_rows_preserve(input_path)
+    for name in OUTPUT_FIELDNAMES:
+        if name not in fieldnames:
+            fieldnames.append(name)
+
+    original_llm = {
+        label: sum(1 for row in original_rows if row.get("is_llm") == label)
+        for label in ("确认", "疑似")
+    }
+    updates = load_gpu_rescan_updates(checkpoint_path) if resume else {}
+    http_rows = [
+        row for row in original_rows
+        if (row.get("protocol") or "").strip() in {"http", "https"}
+    ]
+    pending = [
+        row for row in http_rows
+        if "%s:%s" % (row.get("ip"), row.get("port")) not in updates
+    ]
+    print(
+        "GPU rescan: %d total rows, %d HTTP targets, %d pending"
+        % (len(original_rows), len(http_rows), len(pending))
+    )
+
+    for start in range(0, len(pending), batch_size):
+        batch_rows = pending[start:start + batch_size]
+        states = [_row_to_state(row) for row in batch_rows]
+        await phase_gpu_probe(states, None, cfg)
+        completed: List[dict] = []
+        for original, state in zip(batch_rows, states):
+            _apply_service_classification(state, cfg)
+            state.scan_time = _now()
+            state.analysis = _analysis_text(state)
+            updated = dict(original)
+            updated.update(state.to_row())
+            completed.append(updated)
+            updates["%s:%s" % (state.ip, state.port)] = updated
+        append_gpu_rescan_updates(checkpoint_path, completed)
+        print(
+            "GPU rescan progress: %d/%d HTTP targets"
+            % (min(start + len(completed) + (len(http_rows) - len(pending)),
+                     len(http_rows)), len(http_rows))
+        )
+
+    final_rows = []
+    for row in original_rows:
+        key = "%s:%s" % (row.get("ip"), row.get("port"))
+        final_rows.append(updates.get(key, row))
+    final_llm = {
+        label: sum(1 for row in final_rows if row.get("is_llm") == label)
+        for label in ("确认", "疑似")
+    }
+    if final_llm != original_llm:
+        raise RuntimeError(
+            "GPU rescan changed LLM counts: %s -> %s"
+            % (original_llm, final_llm)
+        )
+    write_csv_atomic(output_path, fieldnames, final_rows)
+    gpu_counts = {
+        label: sum(1 for row in final_rows if row.get("gpu_likelihood") == label)
+        for label in ("高", "中", "低", "未知")
+    }
+    print("GPU rescan complete: %s" % gpu_counts)
+    print("Output: %s" % output_path)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -1057,6 +1553,7 @@ async def run_pipeline(
     rt = cfg.runtime
     p0_c = concurrency_override or rt.phase0.concurrency
     p1_c = concurrency_override or rt.phase1.concurrency
+    gpu_c = rt.gpu_probe.concurrency
     p2_c = concurrency_override or rt.phase2.concurrency
     p3_c = concurrency_override or rt.phase3.concurrency
 
@@ -1090,6 +1587,12 @@ async def run_pipeline(
         if http_alive:
             print("Phase 1: LLM fingerprint (%d targets, concurrency=%d)..." % (len(http_alive), p1_c))
             http_alive = await phase1_fingerprint(http_alive, p1_c, cfg)
+
+        # Independent GPU probe runs for every live HTTP/HTTPS target.
+        if http_alive:
+            print("GPU probe: /metrics + /api/ps (%d targets, concurrency=%d)..."
+                  % (len(http_alive), gpu_c))
+            http_alive = await phase_gpu_probe(http_alive, gpu_c, cfg)
 
         confirmed = [s for s in http_alive if s.is_llm == "确认"]
         suspect = [s for s in http_alive if s.is_llm == "疑似"]
@@ -1135,6 +1638,7 @@ async def run_pipeline(
 
         for s in batch_states:
             _apply_service_classification(s, cfg)
+            s.analysis = _analysis_text(s)
 
         rows = [s.to_row() for s in batch_states]
         write_csv_rows(output_path, rows, append=append_mode)
@@ -1146,8 +1650,11 @@ async def run_pipeline(
         suspect_count = sum(1 for r in rows if r["is_llm"] == "疑似")
         ai_model_count = sum(1 for r in rows if r["service_type"] == "AI模型服务")
         ai_frontend_count = sum(1 for r in rows if r["service_type"] == "AI前端服务")
-        print("  Batch written: %d rows (%d confirmed LLM, %d suspect, %d AI model, %d AI frontend)" % (
-            len(rows), llm_count, suspect_count, ai_model_count, ai_frontend_count
+        gpu_compute_count = sum(1 for r in rows if r["service_type"] == "GPU算力服务")
+        gpu_high_count = sum(1 for r in rows if r["gpu_likelihood"] == "高")
+        print("  Batch written: %d rows (%d confirmed LLM, %d suspect, %d AI model, %d AI frontend, %d GPU compute, %d GPU high)" % (
+            len(rows), llm_count, suspect_count, ai_model_count,
+            ai_frontend_count, gpu_compute_count, gpu_high_count
         ))
 
     # Summary
@@ -1156,12 +1663,21 @@ async def run_pipeline(
     total_suspect = sum(1 for r in all_result_rows if r["is_llm"] == "疑似")
     total_ai_model = sum(1 for r in all_result_rows if r["service_type"] == "AI模型服务")
     total_ai_frontend = sum(1 for r in all_result_rows if r["service_type"] == "AI前端服务")
+    total_gpu_compute = sum(1 for r in all_result_rows if r["service_type"] == "GPU算力服务")
+    gpu_counts = {
+        label: sum(1 for r in all_result_rows if r["gpu_likelihood"] == label)
+        for label in ("高", "中", "低", "未知")
+    }
     print("\n=== Done ===")
     print("Total rows written: %d" % total_written)
     print("LLM confirmed: %d" % total_confirmed)
     print("LLM suspect:   %d" % total_suspect)
     print("AI model services:    %d" % total_ai_model)
     print("AI frontend services: %d" % total_ai_frontend)
+    print("GPU compute services: %d" % total_gpu_compute)
+    print("GPU likelihood: high=%d medium=%d low=%d unknown=%d" % (
+        gpu_counts["高"], gpu_counts["中"], gpu_counts["低"], gpu_counts["未知"]
+    ))
     print("Output: %s" % output_path)
 
 
@@ -1202,6 +1718,10 @@ def main() -> int:
         help="Override concurrency for all phases"
     )
     parser.add_argument(
+        "--gpu-rescan", action="store_true",
+        help="Only re-probe GPU URIs in an existing result CSV; preserve LLM fields"
+    )
+    parser.add_argument(
         "--config", default=None,
         help="Path to YAML rules config (default: llm_scan_rules.yaml next to this script)"
     )
@@ -1230,6 +1750,19 @@ def main() -> int:
     if not input_path.is_file():
         print("Input not found: %s" % input_path, file=sys.stderr)
         return 1
+
+    if args.gpu_rescan:
+        asyncio.run(
+            run_gpu_rescan(
+                input_path=input_path,
+                output_path=output_path,
+                checkpoint_path=checkpoint_path,
+                cfg=cfg,
+                batch_size=args.batch_size,
+                resume=args.resume,
+            )
+        )
+        return 0
 
     targets = read_csv_targets(input_path)
     if not targets:

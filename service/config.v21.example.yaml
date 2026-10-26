@@ -1,0 +1,28 @@
+# No queue connection or scanning occurs with --check. Do not use production credentials in tests.
+contract_version: '2.1'
+database:
+  host: 127.0.0.1
+  port: 3306
+  user: llm_scanner
+  password: env:LLM_SCANNER_MYSQL_PASSWORD
+  database: llm_detect_v21
+  charset: utf8mb4
+  pool_size: 8
+runtime:
+  data_root: /var/lib/llm-detect
+  release_root: vendor/v7
+  default_release: v7-20261026-service21-r3
+  poll_seconds: 5
+  heartbeat_seconds: 10
+  control_seconds: 2
+  lease_seconds: 60
+  grace_seconds: 30
+  kill_seconds: 5
+  max_expanded_hosts: 1000000
+  full_port_executor: local
+  # For remote execution set full_port_executor: remote and an existing strict-host-key INI:
+  # remote_config: /etc/llm-detect/full-port-remote.ini
+  enable_cleanup: false
+  log_level: INFO
+storage_roots:
+  LOCAL: /var/lib/llm-detect

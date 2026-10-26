@@ -1,0 +1,25 @@
+[Unit]
+Description=V7 scanner service (MySQL contract 2.1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# V7 SYN scanning currently checks effective uid=0. Review privileges before installation.
+User=root
+WorkingDirectory=/opt/llm-detect/service
+EnvironmentFile=/etc/llm-detect/service21.env
+ExecStart=/opt/llm-detect/venv/bin/python -m llm_detect.main --config /etc/llm-detect/service21.yaml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+KillMode=control-group
+UMask=0077
+# Keep the machine-wide execution lock visible across service instances.
+PrivateTmp=no
+ProtectSystem=strict
+ReadWritePaths=/var/lib/llm-detect /run/lock
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

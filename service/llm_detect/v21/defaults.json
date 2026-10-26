@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "port_scan": {
+    "batch_size": 500,
+    "parallel_workers": 3,
+    "verify_workers": 12,
+    "min_rate": 3000,
+    "max_retries": 1,
+    "host_timeout_seconds": 120
+  },
+  "identify": {
+    "batch_size": 2000
+  },
+  "gpu_recheck": {
+    "concurrency": 20,
+    "timeout_seconds": 5
+  },
+  "full_port": {
+    "enabled": true,
+    "max_targets": 50,
+    "max_rate": 200,
+    "min_rate": 100,
+    "workers": 6,
+    "max_retries": 0,
+    "host_timeout_seconds": 2400,
+    "process_timeout_seconds": 2700
+  },
+  "active_recheck": {
+    "enabled": true,
+    "concurrency": 4,
+    "tokens": 6,
+    "poll_interval_seconds": 0.5,
+    "metrics_interval_seconds": 2,
+    "timeout_observation_seconds": 300,
+    "delayed_samples_seconds": [
+      2,
+      10
+    ]
+  }
+}

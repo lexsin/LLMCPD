@@ -75,8 +75,11 @@ def scan_ports_for_ips(
     batch_size: int = 100,
     parallel_workers: int = 1,
     stats_every: Optional[str] = "60s",
-    anomaly_threshold: int = 20,
-    verify_workers: int = 4,
+    anomaly_threshold: int = 80,
+    verify_workers: int = 8,
+    verify_host_timeout: str = "15s",
+    verify_max_retries: str = "0",
+    verify_proc_timeout: int = 25,
     low_open_config: Optional[LowOpenConfirmConfig] = None,
     on_batch_done: Optional[BatchCallback] = None,
 ) -> Dict[str, List[int]]:
@@ -93,6 +96,10 @@ def scan_ports_for_ips(
     opts = opts or NmapOptions()
     if not ips:
         return {}
+    if verify_workers < 1:
+        raise ValueError("verify_workers must be >= 1")
+    if verify_proc_timeout < 1:
+        raise ValueError("verify_proc_timeout must be >= 1")
     if shutil.which("nmap") is None:
         raise RuntimeError("nmap not found in PATH")
 
@@ -129,7 +136,12 @@ def scan_ports_for_ips(
                             verify_dir,
                             stats_every,
                             verify_workers,
+                            verify_host_timeout,
+                            verify_max_retries,
+                            verify_proc_timeout,
                         )
+                    except (TypeError, ValueError):
+                        raise
                     except Exception:
                         log.exception("verify_anomalous_ports failed for batch %d", batch_idx)
 
@@ -141,10 +153,7 @@ def scan_ports_for_ips(
                     else:
                         out.setdefault(ip, [])
                 if on_batch_done is not None:
-                    try:
-                        on_batch_done(decoded)
-                    except Exception:
-                        log.exception("on_batch_done failed for batch %d", batch_idx)
+                    on_batch_done(decoded)
 
             return _wrap
 

@@ -1,190 +1,46 @@
-# service
+# V7 扫描 service（MySQL 交接契约 2.1）
 
-把原 `TEST/` 下的 IP→端口→LLM 指纹流水线脚本封装成常驻后台 server,用 SQL 表(`probe_task` / `probe_pending_resource` / `probe_host` / `probe_endpoint` / `probe_asset_port` / `asset_llm`)做输入输出。
+新版以 `probe_task_run` 领取运行，完整执行正式 V7 流水线。Java 创建任务、预登记全部文件、解析输入和周期调度；Python 维护实际运行状态、租约、来源组、系统结果修订和扫描产物。原 TEST、专项副本及临时实验目录未修改。
 
-设计文档见 [design.md](./design.md)。
+当前是待隔离联调的实现，不是生产切换公告。没有执行真实数据库迁移或生产扫描。旧 `probe_task.PENDING` 轮询、自动 ALTER TABLE、全局 asset_llm 发布已退出支持入口；旧仓储文件和 vendor 根目录保留为历史，不供新版调用。旧说明见 `docs/legacy/README-v1.md`，旧 design.md/config.example.yaml 同属 v1，不可用来启动新版。
 
-## 工程布局
+## 入口与配置
 
-```
-service/                              ← 工程根
-├── README.md
-├── design.md
-├── requirements.txt
-├── config.example.yaml
-├── vendor/                           ← 原 TEST/ 下被复用的 4 个脚本 + 规则
-│   ├── ip_port_scan.py
-│   ├── scan_llm.py
-│   ├── scan_config.py
-│   ├── ip_ping_check.py
-│   └── llm_scan_rules.yaml
-└── llm_detect/                   ← Python 包
-    ├── main.py                       # 入口 `python -m llm_detect.main`
-    ├── settings.py                   # YAML → dataclass
-    ├── db.py                         # MySQL 连接池
-    ├── orchestrator.py               # 5s 轮询 → 抢占 → 串跑 4 阶段 → 收尾
-    ├── http_api.py                   # 可选 wake/health
-    ├── repo/                         # task / host / endpoint / asset
-    ├── adapters/                     # nmap_runner / llm_prober(import vendor/)
-    ├── stages/                       # stage1~stage4
-    └── tests/                        # AST + 纯函数 smoke
-```
-
-`vendor/` 是从 `TEST/` 拷贝过来的快照,**与上游脚本同步时手工 diff/复制**(没有 git submodule)。
-
-## 触发与回填一图流
-
-```
-平台前端                             service
-  │  INSERT probe_task(PENDING)      │
-  │  INSERT probe_pending_resource   │
-  └──────────────►                   │
-                                     │  每 5s 轮询 probe_task
-                                     │  抢占 → 串跑 4 阶段
-                                     │   ├ stage1: 展开 IP 段 → probe_host
-                                     │   ├ stage2: ping(默认跳过) + nmap → probe_host.open_ports_json
-                                     │   ├ stage3: 展开 → probe_endpoint
-                                     │   └ stage4: scan_llm → probe_asset_port + UPSERT asset_llm
-                                     │  收尾:probe_task.status = SUCCESS
-```
-
-## 安装
+运行环境：Linux、Python 3.12+、MySQL 8/InnoDB、nmap、正式 V7 所需字体及图像依赖。本轮完整离线验证在 3.43 的 Linux/Python 3.13.11 上执行；此前还做过 Windows/Python 3.12 离线验证。SYN 扫描沿用 V7 root 权限检查。安装依赖不会由服务自动执行。
 
 ```bash
-cd service
-python -m venv .venv
-.venv\Scripts\activate            # Windows
-# Linux: source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+# 另行部署经审核的 2.1 表结构；服务只读检查字段/唯一键/可空性，不执行 DDL。
+# 使用 config.v21.example.yaml 编写独立 config.yaml，不沿用 v1 配置。
+export LLM_SCANNER_MYSQL_PASSWORD='由部署系统注入'
+python -m llm_detect.main --config config.yaml --check
 ```
 
-需要系统装好 `nmap`(命令行 `nmap` 在 PATH 里),Linux 下端口扫描需要 root 跑 SYN。
+`--check` 只校验配置和固定发布包，输出完整 scanner_version，不连接 MySQL、不扫描、不启动 SSH 作业；它不代替 nmap、字体、SSH 及 MySQL 实机联调。实际消费队列的命令仍为 `python -m llm_detect.main --config config.yaml`，`--once` 会连接配置的队列并最多处理一轮，**不是 dry-run**。新版无需 HTTP 下发；不沿用 v1 的 `--http` 入口。
 
-## 配置
+## 实现结构
+
+- `llm_detect/v21/`：配置、发布校验、输入准备、运行仓储、outbox、阶段子进程、远端作业、产物和报告。
+- `vendor/v7/v7-20261026-service21-r3/`：当前正式 V7 运行依赖的固定发布包，`release.json` 记录 SHA-256；service_hooks/service_remote 为兼容接入与守护辅助代码。上一版 r1/r2 目录保留。
+- `tests_v21/`：默认阻断网络的离线测试、模拟完整任务和显式开启的隔离 MySQL 测试。
+- `docs/IMPLEMENTATION_V21.md`：交接格式、运行/恢复、安全边界及验收说明；`deploy/` 仅提供未启用的部署示例。
+
+发布包保留原 CLI 参数和默认扫描行为；仅当 service 显式传入上下文时启用提交、控制、证据绑定和文件写入隔离。升级必须使用新的 releaseId，不能修改已被运行引用的发布包。
+
+## 验证
 
 ```bash
-cp config.example.yaml config.yaml
-# 编辑 database / orchestrator / stages 段
+python -m pip install -r requirements-dev.txt
+python -m pytest tests_v21 -q
 ```
 
-## 启动
+默认测试不连接生产队列或目标 IP。事务测试使用内存 SQLite 验证约束、回滚和重放，不冒充 MySQL 并发测试。真实 MySQL 测试默认跳过，仅在明确开启 V7_ISOLATED_MYSQL=1、提供 V7_TEST_MYSQL_USER/PASSWORD（可选 HOST/PORT）时，在回环地址服务器新建随机 test_v7_* 数据库并仅清理这个测试库。Linux 进程组测试只启动临时休眠 Python 子进程，不调用 nmap。
 
-```bash
-python -m llm_detect.main --config config.yaml
-```
+2026-10-26 在 3.43 对 r3 重跑：**59 passed, 1 skipped**。r2 的 18 个缺陷回归用例保留；r3 新增无浏览器预检回归，匹配 V7 已有的 HTTP 响应图卡流程，中文字体仍为必要依赖。固定发布清单校验通过；跳过项为隔离 MySQL 写入测试。覆盖范围、发布版本及待验收项见 [验证记录](docs/VALIDATION_V21.md)。
 
-或开 HTTP wake/health 端点(`http_api.enabled: true`):
+## 上线前仍需完成
 
-```bash
-python -m llm_detect.main --config config.yaml --http
-```
-
-## 提交一个任务做端到端验证
-
-```sql
--- 1) 创建任务
-INSERT INTO probe_task (task_name, biz_date, param_json, status)
-VALUES ('demo', CURDATE(), '{"nmapProfile":"DEFAULT_LLM_TOP200"}', 'PENDING');
-SET @tid = LAST_INSERT_ID();
-
--- 2) 喂资源(支持 IP_SEGMENT / SINGLE_IP / IP_PORT)
-INSERT INTO probe_pending_resource (task_id, resource_type, resource_value)
-VALUES (@tid, 'SINGLE_IP', '127.0.0.1');
-
--- 3) 等 server 跑完
-SELECT id, status, host_total, host_finished, endpoint_total, endpoint_finished, end_time
-FROM probe_task WHERE id=@tid;
-
--- 4) 看资产
-SELECT host_ip, port, asset_verdict, probe_shape, app_type_code
-FROM probe_asset_port WHERE task_id=@tid;
-
-SELECT host_ip, port, asset_verdict, detect_source, alive_status
-FROM asset_llm
-WHERE (host_ip, port) IN (SELECT host_ip, port FROM probe_asset_port WHERE task_id=@tid);
-```
-
-## 断点续跑
-
-随时 `Ctrl+C`,重启后 server 会:
-
-- 把 `RUNNING/SCANNING/PROBING` 状态的行重置回 `PENDING/PENDING_SCAN`(由 `orchestrator.reset_running_on_startup` 控制)
-- 继续从最早未完成的 host / endpoint 开始
-
-## nmap 调优(stage1_scan 段)
-
-| 配置项 | 默认 | 作用 |
-| --- | --- | --- |
-| `skip_ping` | `true` | 跳过 ping,直接 nmap(默认开,因为运营商网段常屏蔽 ICMP) |
-| `nmap_batch_size` | 100 | 每批扫描的 IP 数,0 表示不分批 |
-| `nmap_parallel_workers` | 1 | 多进程并行扫批数;>1 时启 `ProcessPoolExecutor`,单批 segfault 不影响其他批 |
-| `nmap_stats_every` | `60s` | nmap `--stats-every`,设为 `null` 关闭进度刷屏 |
-| `nmap_anomaly_threshold` | 20 | 单 IP 开放端口数超过此值时视为异常,触发 `-sV --version-intensity 0` 复核(防火墙吞 SYN 的假阳性会扫出几十甚至上百端口);设 `0` 关闭 |
-| `nmap_verify_workers` | 4 | 异常端口复核的线程并发数 |
-
-异常端口复核流程沿用原脚本的 `verify_anomalous_ports`:对触发阈值的 IP 用 `-sV` 重扫已开端口,把 nmap 标为 `tcpwrapped` 的端口剔除掉。复核失败/超时时保留原 SYN 结果,不会把 IP 误判为完全无端口。
-
-### 低开放率确认(low-open-confirm,默认关闭)
-
-针对运营商低开放率大段(防火墙整段吞 SYN 的场景):一批扫完后,若开放 IP 占比 < 阈值或开放 IP 数 < 阈值,认为**整批被防火墙吃了**,触发抽样复扫。
-
-| 配置项 | 默认 | 作用 |
-| --- | --- | --- |
-| `low_open_enabled` | `false` | 总开关。报备 IP 段一般用不到;扫运营商互联网段时建议开 |
-| `low_open_rate_threshold` | `0.005` | 开放 IP 占比 < 0.5% 触发 |
-| `low_open_min_open_ips` | `5` | 或开放 IP 数 < 5 触发 |
-| `low_open_sample_size` | `50` | 抽样复扫的 IP 数 |
-| `low_open_expand_rate_threshold` | `0.01` | 抽样新发现率 ≥ 1% 时扩到全批 |
-| `low_open_extra_ports` | `""` | 扩展端口列表(逗号分隔),空=不扫扩展 |
-| `low_open_min_rate` / `_max_retries` / `_host_timeout` | `1000`/`2`/`300s` | 复扫的 nmap 参数(比正常扫描更慢更准) |
-
-执行顺序:**low-open-confirm → 异常端口复核 → 写 DB**(与原脚本 `make_flush_batch` 一致)。
-
-## 手动模式(CSV 流水线,与 `TEST/` 体验一致)
-
-`vendor/` 下的 4 个 .py 与 `TEST/` 完全一致(逐字节快照),自带 argparse 入口。需要单独跑某段 IP、不想入库时,直接命令行:
-
-```bash
-cd service
-
-# 1) 展开 IP + 可选 ping
-python vendor/ip_ping_check.py --data-dir data/x.xls --col-start START_IP --col-end END_IP --skip-ping
-
-# 2) 端口扫描(488 端口)
-sudo python vendor/ip_port_scan.py --input data/x_result.csv --batch-size 100 --resume
-
-# 3) 端口展开
-python vendor/expand_scan_ports.py --input data/x_result_scan_result.csv --output data/x_expanded.csv
-
-# 4) LLM 指纹
-python vendor/scan_llm.py --input data/x_expanded.csv --output data/x_llm.csv --resume
-```
-
-CLI 参数、cache.json(`port_scan_cache.json` / `llm_scan_checkpoint.jsonl`)、`--resume` 断点 —— 行为与 [`TEST/README.md`](../TEST/README.md) 描述完全一致。
-
-**适用场景**:调试规则、临时扫一段不想入库、对比新旧 server 输出。
-
-**不适用**:常规生产扫描(走后台 server,DB 触发)。
-
-## 与原脚本的关系
-
-- `vendor/scan_config.py` 与 `vendor/llm_scan_rules.yaml` 一字不动直接复用
-- `vendor/ip_ping_check.py` 的 `expand_range / ping_one` 直接 import
-- `vendor/scan_llm.py` 的 `phase0_protocol / phase1_fingerprint / phase2_deploy / phase3_model / TargetState / _apply_service_classification` 直接 import,跳过 `run_pipeline`(它绑了 CSV)
-- `vendor/ip_port_scan.py` 的 `run_nmap_scan / verify_anomalous_ports / maybe_confirm_low_open_batch` 与 `NmapOptions / LowOpenConfirmConfig / SCAN_PORTS` 直接 import
-- nmap 调用在 `llm_detect/adapters/nmap_runner.py` 里包了一层薄壳,接受 `List[ip]` 返回 `Dict[ip, List[port]]`,把 CSV 输入换成 DB 输出
-
-## 同步上游
-
-如果 `TEST/` 下的脚本有更新,需要把 `vendor/` 同步过来:
-
-```bash
-cp <upstream-test>/{ip_port_scan,scan_llm,scan_config,ip_ping_check}.py service/vendor/
-cp <upstream-test>/llm_scan_rules.yaml                                   service/vendor/
-```
-
-变更后跑一次 smoke 验证 import 链没断:
-
-```bash
-python -m llm_detect.tests.smoke
-```
+- 隔离 MySQL 8 实测和 Java 2.1 下发联调；本次环境未提供可用隔离 MySQL。
+- Linux 本地进程组与守护程序的临时进程测试已通过；真实 SSH 远端停止/恢复、断链、服务重启接管和部署共享存储 flock/fsync 仍需隔离实机验收。
+- 自动任务文件删除保持关闭：Java 在途上传/解析/导出的停止屏障尚未确认，服务不会擅自推进 WAIT_STOP 或删除用户文件。enable_cleanup=true 会明确拒绝启动，避免假装清理协议已完成。
+- 控制终态竞争和 Java 对 SOURCE/RUN 报告版本的解释，仍按此前暂缓事项协调；本轮未修改两份桌面设计文档。

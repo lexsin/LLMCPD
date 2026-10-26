@@ -18,7 +18,7 @@ from typing import Dict, List
 
 from ..adapters import bootstrap_test_path
 from ..adapters.nmap_runner import LowOpenConfirmConfig, NmapOptions, scan_ports_for_ips
-from ..repo import host_repo
+from ..repo import host_repo, task_repo
 from ..settings import Stage1Config
 
 bootstrap_test_path()
@@ -37,9 +37,9 @@ def _build_low_open_config(cfg: Stage1Config) -> LowOpenConfirmConfig:
         expand_rate_threshold=cfg.low_open_expand_rate_threshold,
         extra_ports=cfg.low_open_extra_ports,
         nmap_options=NmapOptions(
-            min_rate=cfg.low_open_min_rate,
-            max_retries=cfg.low_open_max_retries,
-            host_timeout=cfg.low_open_host_timeout,
+            min_rate=str(cfg.low_open_min_rate),
+            max_retries=str(cfg.low_open_max_retries),
+            host_timeout=str(cfg.low_open_host_timeout),
         ),
     )
 
@@ -58,12 +58,13 @@ def _ping_many(ips: List[str], workers: int, timeout: float) -> Dict[str, str]:
     return out
 
 
-def run_scan(task_id: int, cfg: Stage1Config) -> Dict[str, List[int]]:
+def run_scan(task_id: int, cfg: Stage1Config, worker_id: str) -> Dict[str, List[int]]:
     """对该 task 还没扫的 host 做 ping + nmap。
 
     nmap 每批结束后立刻把结果写回 probe_host(``on_batch_done`` 回调)。
     返回汇总后的 ``{ip: open ports}``,主要用于上层日志/统计;真源是 DB。
     """
+    task_repo.require_lease(task_id, worker_id)
     rows = host_repo.list_hosts_to_scan(task_id)
     if not rows:
         log.info("task %s stage2: no hosts to scan", task_id)
@@ -73,7 +74,9 @@ def run_scan(task_id: int, cfg: Stage1Config) -> Dict[str, List[int]]:
     log.info("task %s stage2: %d hosts to scan", task_id, len(ips))
 
     # 标记 SCANNING(把所有目标先标上,这样断点续跑时能识别)
-    for ip in ips:
+    for idx, ip in enumerate(ips):
+        if idx % 100 == 0:
+            task_repo.require_lease(task_id, worker_id)
         host_repo.mark_host_scanning(task_id, ip)
 
     # 1) Ping
@@ -87,7 +90,9 @@ def run_scan(task_id: int, cfg: Stage1Config) -> Dict[str, List[int]]:
                  task_id, len(alive_ips), len(ips))
 
         # 给 ping 不通的 IP 直接落 VERDICT_DONE,不进 nmap
-        for ip in ips:
+        for idx, ip in enumerate(ips):
+            if idx % 100 == 0:
+                task_repo.require_lease(task_id, worker_id)
             if ping_result.get(ip) != "success":
                 host_repo.finish_host_scan(
                     task_id, ip,
@@ -99,15 +104,17 @@ def run_scan(task_id: int, cfg: Stage1Config) -> Dict[str, List[int]]:
     # 2) Nmap —— 复用原脚本 run_nmap_scan,逐批回调写库
     if not alive_ips:
         return {}
+    task_repo.require_lease(task_id, worker_id)
 
     opts = NmapOptions(
-        min_rate=cfg.nmap_min_rate,
-        max_retries=cfg.nmap_max_retries,
-        host_timeout=cfg.nmap_host_timeout,
+        min_rate=str(cfg.nmap_min_rate),
+        max_retries=str(cfg.nmap_max_retries),
+        host_timeout=str(cfg.nmap_host_timeout),
     )
 
     def _on_batch(batch: Dict[str, List[int]]) -> None:
         """每批扫完 → 立即写 probe_host。"""
+        task_repo.require_lease(task_id, worker_id)
         for ip, ports in batch.items():
             ping_state = ping_result.get(ip, "skipped")
             if ports:
@@ -139,9 +146,17 @@ def run_scan(task_id: int, cfg: Stage1Config) -> Dict[str, List[int]]:
             stats_every=cfg.nmap_stats_every,
             anomaly_threshold=cfg.nmap_anomaly_threshold,
             verify_workers=cfg.nmap_verify_workers,
+            verify_host_timeout=str(cfg.nmap_verify_host_timeout),
+            verify_max_retries=str(cfg.nmap_verify_max_retries),
+            verify_proc_timeout=cfg.nmap_verify_proc_timeout,
             low_open_config=_build_low_open_config(cfg),
             on_batch_done=_on_batch,
         )
+    except task_repo.LeaseLostError:
+        raise
+    except (TypeError, ValueError) as exc:
+        log.exception("task %s nmap configuration/adapter error: %s", task_id, exc)
+        raise
     except Exception as exc:
         log.exception("task %s nmap failed: %s", task_id, exc)
         # 已扫完的批已经在 _on_batch 里落盘了,剩下未扫的留在 SCANNING 状态,

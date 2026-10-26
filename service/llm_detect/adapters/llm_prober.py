@@ -35,6 +35,7 @@ _APP_TYPE_BY_SERVICE = {
     "LLM服务": 2,         # 2=定制化/私有化部署
     "AI模型服务": 2,
     "AI前端服务": 1,       # 1=平台化服务
+    "GPU算力服务": 2,      # 2=本机算力/推理基础设施
     "普通Web": None,
     "非HTTP": None,
 }
@@ -43,7 +44,7 @@ _APP_TYPE_BY_SERVICE = {
 def _to_shape(state: "_slm.TargetState") -> str:
     """根据 service_type 推 probe_shape ∈ {FRAMEWORK, WEB, UNKNOWN}。"""
     st = (state.service_type or "").strip()
-    if st in {"LLM服务", "AI模型服务"}:
+    if st in {"LLM服务", "AI模型服务", "GPU算力服务"}:
         return "FRAMEWORK"
     if st in {"AI前端服务", "普通Web"}:
         return "WEB"
@@ -82,6 +83,7 @@ async def probe_endpoints(
     rt = cfg.runtime
     p0_c = concurrency_override or rt.phase0.concurrency
     p1_c = concurrency_override or rt.phase1.concurrency
+    gpu_c = rt.gpu_probe.concurrency
     p2_c = concurrency_override or rt.phase2.concurrency
     p3_c = concurrency_override or rt.phase3.concurrency
 
@@ -100,6 +102,10 @@ async def probe_endpoints(
     # Phase 1
     if http_alive:
         http_alive = await _slm.phase1_fingerprint(http_alive, p1_c, cfg)
+
+    # GPU probing uses its own conservative concurrency/timeout/retry policy.
+    if http_alive:
+        http_alive = await _slm.phase_gpu_probe(http_alive, gpu_c, cfg)
 
     confirmed = [s for s in http_alive if s.is_llm == "确认"]
     suspect = [s for s in http_alive if s.is_llm == "疑似"]
@@ -136,6 +142,7 @@ async def probe_endpoints(
 
     for s in final_states:
         _slm._apply_service_classification(s, cfg)
+        s.analysis = _slm._analysis_text(s)
 
     return [_state_to_record(s) for s in final_states]
 
@@ -154,6 +161,8 @@ def _state_to_record(state: "_slm.TargetState") -> Dict[str, Any]:
         "model_info": state.model_info,
         "gpu_likelihood": state.gpu_likelihood,
         "gpu_evidence": state.gpu_evidence,
+        "gpu_probe_detail": state.gpu_probe_detail,
+        "analysis": state.analysis,
         "scan_time": state.scan_time,
         "evidence_preview": (state.evidence_str() or "")[:1000],
     }
